@@ -1,0 +1,31 @@
+[project]
+name = "e2hat-server"
+version = "0.1.0"
+description = "e2hat relay server - blind encrypted message relay using Massey-Omura"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp",
+    "ecutils",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "B",    # flake8-bugbear
+    "S",    # flake8-bandit (security)
+    "UP",   # pyupgrade
+]
+ignore = [
+    "S311",  # random is fine here (not used for crypto secrets)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"server/app.py" = ["E402"]

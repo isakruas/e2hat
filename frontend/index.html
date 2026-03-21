@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+
+    <title>e2hat - Simple end-to-end encrypted chat</title>
+    <meta name="description" content="e2hat is a simple, open-source, end-to-end encrypted messaging app built on elliptic curve cryptography. No accounts, no tracking, just math-backed privacy.">
+    <meta name="keywords" content="e2hat, encrypted chat, end-to-end encryption, elliptic curve, open source, privacy, secure messaging, Koblitz, Diffie-Hellman, Massey-Omura, secp521r1">
+    <meta name="author" content="e2hat contributors">
+    <meta name="robots" content="index, follow">
+
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="e2hat - Simple end-to-end encrypted chat">
+    <meta property="og:description" content="Open-source encrypted messaging built on solid mathematics. Simple code, real privacy. Use community servers or host your own.">
+    <meta property="og:image" content="icon.svg">
+    <meta property="og:site_name" content="e2hat">
+
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="e2hat - Simple end-to-end encrypted chat">
+    <meta name="twitter:description" content="Open-source encrypted messaging built on solid mathematics. Simple code, real privacy.">
+    <meta name="twitter:image" content="icon.svg">
+
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="e2hat">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#0f0f0f">
+    <meta name="application-name" content="e2hat">
+
+    <link rel="manifest" href="manifest.json">
+    <link rel="icon" href="icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="icon.svg">
+    <link rel="canonical" href="https://github.com/isakruas/e2hat">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Setup Screen -->
+        <div v-if="screen === 'setup'" class="setup">
+            <h1>e2hat</h1>
+            <p class="subtitle">End-to-end encrypted chat with elliptic curves</p>
+
+            <!-- Restore saved keys -->
+            <div v-if="hasSavedKeys && !restoredKeys" class="restore-box">
+                <p class="restore-label">Saved keys found. Enter password to restore:</p>
+                <input v-model="restorePassword" type="password" placeholder="Password"
+                       @keyup.enter="restoreKeys" />
+                <button @click="restoreKeys">Restore Keys</button>
+                <button class="secondary" @click="clearSavedKeys">Discard &amp; Generate New</button>
+            </div>
+
+            <template v-if="!hasSavedKeys || restoredKeys">
+                <input v-model="nickname" placeholder="Your nickname" @keyup.enter="enterChat" />
+
+                <button @click="generateKeys" :disabled="!!compressedPubKeyDisplay">
+                    Generate Keys
+                </button>
+
+                <div v-if="compressedPubKeyDisplay" class="info copyable" @click="copyPubKey">
+                    <strong>Your public key <span class="copy-hint">(tap to copy)</span>:</strong><br>
+                    <span class="key-text">{{ compressedPubKeyDisplay }}</span>
+                    <div v-if="copied" class="copied-toast">Copied!</div>
+                </div>
+
+                <!-- Save keys with password -->
+                <div v-if="compressedPubKeyDisplay && !keysSaved" class="save-keys">
+                    <input v-model="savePassword" type="password" placeholder="Password to encrypt keys" />
+                    <button @click="saveKeys" :disabled="!savePassword.trim()">Save Keys Locally</button>
+                </div>
+                <div v-if="keysSaved" class="status">Keys saved encrypted in localStorage</div>
+
+                <button @click="enterChat" :disabled="!nickname.trim() || !compressedPubKeyDisplay">
+                    Enter Chat
+                </button>
+            </template>
+
+            <div v-if="status" class="status">{{ status }}</div>
+        </div>
+
+        <!-- Chat Screen -->
+        <div v-if="screen === 'chat'" class="chat">
+
+            <!-- Top bar -->
+            <div class="topbar">
+                <h2>e2hat</h2>
+                <span class="nick">{{ nickname }}</span>
+                <!-- Mobile nav buttons -->
+                <button class="mobile-only" v-if="view === 'chat'" @click="view = 'contacts'">Contacts</button>
+                <button class="mobile-only" v-if="view === 'contacts' && activeContact" @click="view = 'chat'">Chat</button>
+                <button class="mobile-only" v-if="view !== 'servers'" @click="view = 'servers'">Servers</button>
+                <button class="mobile-only" v-if="view === 'servers'" @click="view = 'contacts'">Back</button>
+                <!-- Desktop toggle -->
+                <button class="desktop-only" @click="showServers = !showServers">
+                    {{ showServers ? 'Hide Servers' : 'Servers' }}
+                </button>
+                <button class="logout-btn" @click="logout">Logout</button>
+            </div>
+
+            <!-- Desktop sidebar wrapper -->
+            <div class="desktop-sidebar">
+
+            <!-- Servers Panel -->
+            <div class="panel-servers" :class="{ hidden: view !== 'servers', 'desktop-hidden': !showServers }">
+                <div class="section-header">Servers</div>
+
+                <div class="add-contact-toggle" @click="showAddServer = !showAddServer">
+                    {{ showAddServer ? '&minus; Hide' : '+ Add Server' }}
+                </div>
+                <div v-if="showAddServer" class="add-server">
+                    <input v-model="newServerName" placeholder="Server name" />
+                    <input v-model="newServerUrl" placeholder="ws://host:port/ws" />
+                    <button @click="addServer">Add Server</button>
+                </div>
+
+                <div class="server-list">
+                    <div v-for="(srv, index) in servers" :key="srv.url" class="server-item">
+                        <div class="server-status-dot" :class="srv.state"></div>
+                        <div class="server-info">
+                            <div class="server-name">{{ srv.name }}</div>
+                            <div class="server-url">{{ srv.url }}</div>
+                        </div>
+                        <button v-if="srv.state === 'disconnected'" class="server-btn connect"
+                                @click="connectServer(index)">Connect</button>
+                        <button v-if="srv.state === 'connected'" class="server-btn disconnect"
+                                @click="disconnectServer(index)">Disconnect</button>
+                        <button v-if="srv.state === 'connecting'" class="server-btn" disabled>...</button>
+                        <button class="contact-delete" @click="removeServer(index)">&times;</button>
+                    </div>
+                </div>
+
+                <div v-if="servers.length === 0" class="empty-hint">
+                    Add a server to start chatting
+                </div>
+            </div>
+
+            <!-- Contacts Panel -->
+            <div class="panel-contacts" :class="{ hidden: view !== 'contacts' }">
+                <div class="my-key" @click="copyPubKey">
+                    <div class="my-key-label">Your public key <span class="copy-hint">(tap to copy)</span>:</div>
+                    <div class="my-key-value">{{ compressedPubKeyDisplay }}</div>
+                    <div v-if="copied" class="copied-toast">Copied!</div>
+                </div>
+
+                <div class="add-contact-toggle" @click="showAddContact = !showAddContact">
+                    {{ showAddContact ? '&minus; Hide' : '+ Add Contact' }}
+                </div>
+                <div v-if="showAddContact" class="add-contact">
+                    <input v-model="newContactNick" placeholder="Contact nickname" />
+                    <input v-model="newContactKey" placeholder="Contact public key" />
+                    <button @click="addContact">Add Contact</button>
+                </div>
+
+                <div class="contacts-list">
+                    <div v-for="(contact, index) in contacts" :key="contact.keyHex"
+                         class="contact-item"
+                         @click="selectContact(contact)">
+                        <div class="contact-status" :class="{ online: isOnline(contact.keyHex) }"></div>
+                        <div v-if="editingContact !== index" class="contact-name">{{ contact.nickname }}</div>
+                        <input v-else class="contact-edit-input"
+                               :value="contact.nickname"
+                               @keyup.enter="finishEditContact(index, $event.target.value)"
+                               @blur="finishEditContact(index, $event.target.value)"
+                               @click.stop />
+                        <div v-if="unreadCount(contact.keyHex) > 0" class="contact-badge">
+                            {{ unreadCount(contact.keyHex) }}
+                        </div>
+                        <button class="contact-edit-btn" @click.stop="startEditContact(index)" title="Edit">&#9998;</button>
+                        <button class="contact-delete" @click.stop="removeContact(index)" title="Delete">&times;</button>
+                    </div>
+                </div>
+            </div>
+
+            </div><!-- /desktop-sidebar -->
+
+            <!-- Chat Panel -->
+            <div class="panel-chat" :class="{ hidden: view !== 'chat' }">
+                <template v-if="activeContact">
+                    <div class="chat-header">
+                        <button class="back-btn" @click="view = 'contacts'">&larr;</button>
+                        <span>{{ activeContact.nickname }}</span>
+                        <span v-if="isOnline(activeContact.keyHex)" class="online-dot"></span>
+                    </div>
+
+                    <div class="messages" ref="messagesEl">
+                        <div v-for="(msg, i) in activeMessages" :key="i"
+                             class="message" :class="{ sent: msg.sent, received: !msg.sent }">
+                            {{ msg.text }}
+                            <div class="time">
+                                {{ msg.time }}
+                                <span v-if="msg.sent" class="msg-status" :class="msg.status || 'sending'">
+                                    <span v-if="msg.status === 'sending'" class="status-icon">&#8987;</span>
+                                    <span v-else-if="msg.status === 'sent'" class="status-icon">&#10003;</span>
+                                    <span v-else-if="msg.status === 'delivered'" class="status-icon">&#10003;&#10003;</span>
+                                    <span v-else-if="msg.status === 'queued'" class="status-icon">&#9719;</span>
+                                    <span v-else class="status-icon">&#8987;</span>
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="input-area">
+                        <input v-model="messageInput"
+                               placeholder="Type a message..."
+                               @keyup.enter="sendMessage" />
+                        <button @click="sendMessage" :disabled="!messageInput.trim()">Send</button>
+                    </div>
+                </template>
+
+                <div v-else class="no-chat">
+                    Select a contact to start chatting
+                </div>
+            </div>
+
+            <!-- Resizable Log Panel -->
+            <div class="log-wrapper" :style="{ height: logHeight + 'px' }">
+                <div class="log-drag-handle"
+                     @mousedown.prevent="startLogResize"
+                     @touchstart.prevent="startLogResize">
+                    <div class="grip"></div>
+                </div>
+                <div class="log-area" :style="{ height: (logHeight - 14) + 'px' }" ref="logEl">
+                    <div v-for="(entry, i) in logs" :key="i">{{ entry }}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://unpkg.com/js-ecutils@latest/dist/web/min.js"></script>
+    <script src="protocol.js"></script>
+    <script src="app.js"></script>
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('sw.js')
+                    .then((r) => console.log('SW registered:', r.scope))
+                    .catch((e) => console.error('SW failed:', e));
+            });
+        }
+    </script>
+</body>
+</html>

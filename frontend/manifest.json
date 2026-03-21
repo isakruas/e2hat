@@ -1,0 +1,19 @@
+{
+  "name": "e2hat",
+  "short_name": "e2hat",
+  "description": "End-to-end encrypted chat with elliptic curves",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#0f0f0f",
+  "background_color": "#0f0f0f",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

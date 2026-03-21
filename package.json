@@ -1,0 +1,17 @@
+{
+    "name": "e2hat",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "description": "e2hat - Simple end-to-end encrypted chat",
+    "scripts": {
+        "lint": "eslint frontend/",
+        "lint:fix": "eslint frontend/ --fix",
+        "lint:py": "ruff check server/",
+        "lint:py:fix": "ruff check server/ --fix",
+        "lint:all": "npm run lint && npm run lint:py"
+    },
+    "devDependencies": {
+        "eslint": "^9"
+    }
+}
