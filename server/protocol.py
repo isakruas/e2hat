@@ -234,3 +234,4 @@ def pack_msg_queued(session_id):
 ERR_USER_NOT_FOUND = 0x01   # Destination public key not connected to this server
 ERR_INVALID_FRAME = 0x02    # Malformed or unrecognized frame
 ERR_SESSION_EXPIRED = 0x03  # Session ID not found or already completed
+ERR_RATE_LIMITED = 0x04     # Too many messages, slow down

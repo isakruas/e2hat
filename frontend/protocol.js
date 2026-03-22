@@ -42,6 +42,7 @@ const MSG_QUEUED = 0x35;      // Recipient offline, message queued
 const ERR_USER_NOT_FOUND = 0x01;
 const ERR_INVALID_FRAME = 0x02;
 const ERR_SESSION_EXPIRED = 0x03;
+const ERR_RATE_LIMITED = 0x04;
 
 /**
  * Convert a BigInt to a fixed-size big-endian Uint8Array.
@@ -228,7 +229,7 @@ window.Protocol = {
     MO_RECV_INIT, MO_RECV_STEP2, MO_RECV_STEP3,
     ERROR, PEER_ONLINE, PEER_OFFLINE,
     MSG_ACK, MSG_DELIVERED, MSG_QUEUED,
-    ERR_USER_NOT_FOUND, ERR_INVALID_FRAME, ERR_SESSION_EXPIRED,
+    ERR_USER_NOT_FOUND, ERR_INVALID_FRAME, ERR_SESSION_EXPIRED, ERR_RATE_LIMITED,
     COORD_SIZE, POINT_SIZE,
     bigintToBytes, bytesToBigint,
     packPoint, unpackPoint,

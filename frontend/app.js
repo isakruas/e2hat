@@ -3,14 +3,15 @@
  *
  * Cryptographic flow for sending a message:
  *   1. Koblitz.encode(nonce + text) -> (M, j)   Text becomes a curve point (nonce for non-determinism)
- *   2. E = M * S.x                              Encrypt with DH shared secret S = DH(privA, pubB)
- *   3. ECDSA.sign(E.x, timestamp, dest)         Sign for authentication and anti-replay
- *   4. C1 = mo.encrypt(E)                       MO layer for transit to server
- *   5. Server 3-pass (SEND_INIT/STEP2/STEP3)    Server receives E without seeing M
- *   6. Server 3-pass (RECV_INIT/STEP2/STEP3)    Receiver gets E + signature
- *   7. ECDSA.verify(sig, sender_pubkey)          Verify authenticity
- *   8. M = E * modInverse(S.x, n)               Decrypt with DH shared secret
- *   9. Koblitz.decode(M, j) -> nonce + text      Curve point becomes text (strip nonce)
+ *   2. scalar = HKDF(DH(privA,pubB).x, ts:dest:j)  Derive per-message scalar via HKDF-SHA256
+ *   3. E = M * scalar                           Encrypt with derived scalar
+ *   4. ECDSA.signMessage(E.x:eParity:j:ts:dest) Sign for authentication and anti-replay
+ *   5. C1 = mo.encrypt(E)                       MO layer for transit to server
+ *   6. Server 3-pass (SEND_INIT/STEP2/STEP3)    Server receives E without seeing M
+ *   7. Server 3-pass (RECV_INIT/STEP2/STEP3)    Receiver gets E + signature
+ *   8. ECDSA.verifyMessage(sig, sender_pubkey)   Verify authenticity
+ *   9. M = E * modInverse(scalar, n)            Decrypt with inverse of derived scalar
+ *  10. Koblitz.decode(M, j) -> nonce + text      Curve point becomes text (strip nonce)
  *
  * The server only ever sees E (encrypted with DH). It cannot derive the DH
  * shared secret because it doesn't have either party's private key.
@@ -42,11 +43,14 @@ function generateNonce() {
 
 /** Generate a random private key in range [2, n-1] for secp521r1. */
 function randomPrivateKey() {
-    const bytes = new Uint8Array(66);
-    crypto.getRandomValues(bytes);
-    let k = 0n;
-    for (const b of bytes) k = (k << 8n) | BigInt(b);
-    return (k % (curve.n - 2n)) + 2n;
+    while (true) {
+        const bytes = new Uint8Array(66);
+        crypto.getRandomValues(bytes);
+        bytes[0] &= 0x01; // mask to 521 bits
+        let k = 0n;
+        for (const b of bytes) k = (k << 8n) | BigInt(b);
+        if (k >= 2n && k < curve.n) return k;
+    }
 }
 
 function gcd(a, b) {
@@ -77,15 +81,36 @@ function hexToPoint(hex) {
 
 /** Modular inverse via extended Euclidean algorithm. */
 function modInverse(a, m) {
+    // Fermat's little theorem: a^(-1) = a^(m-2) mod m (for prime m)
     a = ((a % m) + m) % m;
-    let [old_r, r] = [a, m];
-    let [old_s, s] = [1n, 0n];
-    while (r !== 0n) {
-        const q = old_r / r;
-        [old_r, r] = [r, old_r - q * r];
-        [old_s, s] = [s, old_s - q * s];
+    let result = 1n;
+    let base = a;
+    let exp = m - 2n;
+    while (exp > 0n) {
+        if (exp & 1n) result = result * base % m;
+        exp >>= 1n;
+        base = base * base % m;
     }
-    return ((old_s % m) + m) % m;
+    return result;
+}
+
+// --- HKDF: derive scalar from DH shared secret (RFC 5869 / NIST SP 800-56A) ---
+
+/** Derive a per-message curve scalar from DH shared secret via HKDF-SHA256.
+ *  The info string binds the derivation to the specific message context:
+ *  - timestampMs: per-message uniqueness (breaks algebraic E_i/E_j = M_i/M_j)
+ *  - destHex: binds to recipient identity
+ *  - j: binds to Koblitz encoding parameter */
+async function deriveScalar(sharedX, timestampMs, destHex, j) {
+    const sharedBytes = bigintToFixedBytes(sharedX, 66); // 521-bit key -> 66 bytes
+    const hkdfKey = await crypto.subtle.importKey('raw', sharedBytes, 'HKDF', false, ['deriveBits']);
+    const info = new TextEncoder().encode(`e2hat:${timestampMs}:${destHex}:${j}`);
+    const derived = await crypto.subtle.deriveBits(
+        { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(66), info },
+        hkdfKey, 528 // derive 528 bits, then reduce mod n
+    );
+    const raw = BigInt('0x' + bytesToHex(new Uint8Array(derived)));
+    return (raw % (curve.n - 1n)) + 1n; // ensure [1, n-1]
 }
 
 // --- Key derivation and encryption (AES-GCM) ---
@@ -146,7 +171,7 @@ function fixedBytesToBigint(bytes) {
 // --- IndexedDB storage ---
 
 const DB_NAME = 'e2hat';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 let _db = null;
 
 function openDB() {
@@ -155,7 +180,7 @@ function openDB() {
         const req = indexedDB.open(DB_NAME, DB_VERSION);
         req.onupgradeneeded = (e) => {
             const db = e.target.result;
-            for (const name of ['config', 'keys', 'messages']) {
+            for (const name of ['config', 'keys', 'messages', 'replayGuard']) {
                 if (!db.objectStoreNames.contains(name)) db.createObjectStore(name);
             }
         };
@@ -256,7 +281,24 @@ createApp({
         const pendingRecvSessions = reactive({});
         const sentMessageMap = reactive({});
         const retryQueues = {};
-        const seenSignatures = new Set(); // Anti-replay: track received signature fingerprints
+        const seenSignatures = new Map(); // Anti-replay: fingerprint → timestamp
+        const REPLAY_MAX_AGE = 5 * 60 * 1000; // 5 minutes
+        let _replayPersistTimer = null;
+        function persistReplayGuard() {
+            if (_replayPersistTimer) return;
+            _replayPersistTimer = setTimeout(async () => {
+                _replayPersistTimer = null;
+                const obj = Object.fromEntries(seenSignatures);
+                await idbPut('replayGuard', 'signatures', obj);
+            }, 1000);
+        }
+        function flushReplayGuardNow() {
+            if (_replayPersistTimer) clearTimeout(_replayPersistTimer);
+            _replayPersistTimer = null;
+            const obj = Object.fromEntries(seenSignatures);
+            idbPut('replayGuard', 'signatures', obj);
+        }
+        window.addEventListener('beforeunload', flushReplayGuardNow);
         const pendingMultiparts = {};  // senderHex:groupId -> { total, parts: {idx: text}, ... }
 
         const koblitz = new Koblitz(CURVE_NAME);
@@ -293,6 +335,16 @@ createApp({
                     contactList.unshift(DEFAULT_CONTACT);
                 }
                 contactList.forEach(c => contacts.push(c));
+                // Restore replay guard from IndexedDB
+                try {
+                    const stored = await idbGet('replayGuard', 'signatures');
+                    if (stored) {
+                        const now = Date.now();
+                        for (const [fp, ts] of Object.entries(stored)) {
+                            if (now - ts <= REPLAY_MAX_AGE) seenSignatures.set(fp, ts);
+                        }
+                    }
+                } catch (_e) { /* replayGuard store may not exist yet */ }
             } catch (e) {
                 console.error('Failed to load from IndexedDB:', e);
                 // Fallback: add defaults
@@ -391,13 +443,19 @@ createApp({
 
         // --- Persistence (IndexedDB) ---
 
+        function cleanMsgForStorage(m) {
+            if (m.e_x) { const { text, _blobUrl, _receiving, _multipartDone, ...rest } = m; return rest; }
+            const { _blobUrl, _receiving, _multipartDone, ...rest } = m;
+            return rest;
+        }
+
         function saveMessages(contactHex) {
             if (contactHex) {
-                const list = (messages[contactHex] || []).map(({ text, ...rest }) => rest);
+                const list = (messages[contactHex] || []).map(cleanMsgForStorage);
                 idbPut('messages', contactHex, list);
             } else {
                 for (const key of Object.keys(messages)) {
-                    const list = messages[key].map(({ text, ...rest }) => rest);
+                    const list = messages[key].map(cleanMsgForStorage);
                     idbPut('messages', key, list);
                 }
             }
@@ -412,6 +470,12 @@ createApp({
             const invCache = {};
             let totalLoaded = 0;
             let totalExpired = 0;
+            const BATCH_SIZE = 5; // decrypt N messages per tick to avoid CPU spike
+
+            function yieldToUI() {
+                return new Promise(resolve => setTimeout(resolve, 0));
+            }
+
             for (const contactHex of keys) {
                 const msgList = await idbGet('messages', contactHex);
                 if (!msgList) continue;
@@ -423,26 +487,47 @@ createApp({
                     if (fresh.length === 0) { idbDel('messages', contactHex); continue; }
                     idbPut('messages', contactHex, fresh);
                 }
-                messages[contactHex] = fresh.map(m => {
-                    if (!m.e_x) return { ...m, text: '[unreadable]' };
-                    try {
-                        if (!invCache[contactHex]) {
-                            const pt = hexToPoint(contactHex);
-                            const pubKey = Point.decompress(pt.x, pt.parity, curve);
-                            const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
-                            const shared = dh.computeSharedSecret(pubKey);
-                            invCache[contactHex] = modInverse(shared.x, curve.n);
+                // Load messages: text/media immediately, encrypted text in batches
+                const result = new Array(fresh.length);
+                let decryptCount = 0;
+                for (let i = 0; i < fresh.length; i++) {
+                    const m = fresh[i];
+                    if (m.text) {
+                        result[i] = { ...m }; // already has text (multipart/media)
+                    } else if (!m.e_x) {
+                        result[i] = { ...m, text: '[unreadable]' };
+                    } else {
+                        try {
+                            if (!invCache[contactHex]) {
+                                const pt = hexToPoint(contactHex);
+                                const pubKey = Point.decompress(pt.x, pt.parity, curve);
+                                const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
+                                invCache[contactHex] = dh.computeSharedSecret(pubKey).x;
+                            }
+                            const sharedX = invCache[contactHex];
+                            // For sent messages, dest=contactHex; for received, dest=me
+                            const hkdfDest = m.sent ? contactHex : myPubKeyHex.value;
+                            // Use original sender timestamp (sigTs) if available, else ts
+                            const hkdfTs = m.sigTs || m.ts;
+                            const scalar = await deriveScalar(sharedX, hkdfTs, hkdfDest, m.j);
+                            const invScalar = modInverse(scalar, curve.n);
+                            const ePoint = Point.decompress(BigInt('0x' + m.e_x), BigInt(m.e_parity), curve);
+                            const mPoint = ePoint.mul(invScalar);
+                            let decoded = koblitz.decode(mPoint, m.j);
+                            if (m.nonce) decoded = decoded.substring(NONCE_LEN);
+                            result[i] = { ...m, text: decoded };
+                        } catch {
+                            result[i] = { ...m, text: '[decrypt error]' };
                         }
-                        const ePoint = Point.decompress(BigInt('0x' + m.e_x), BigInt(m.e_parity), curve);
-                        const mPoint = ePoint.mul(invCache[contactHex]);
-                        let decoded = koblitz.decode(mPoint, m.j);
-                        if (m.nonce) decoded = decoded.substring(NONCE_LEN);
-                        return { ...m, text: decoded };
-                    } catch {
-                        return { ...m, text: '[decrypt error]' };
+                        decryptCount++;
+                        if (decryptCount % BATCH_SIZE === 0) {
+                            await yieldToUI();
+                        }
                     }
-                });
-                totalLoaded += messages[contactHex].length;
+                }
+                messages[contactHex] = result;
+                totalLoaded += result.length;
+                await yieldToUI(); // yield between contacts
             }
             log(`Messages restored: ${totalLoaded} messages across ${keys.length} conversations${totalExpired ? ` (${totalExpired} expired, removed)` : ''}`);
         }
@@ -730,7 +815,7 @@ createApp({
         }
 
         // === PROTOCOL HANDLER (per server) ===
-        function handleServerMessage(srvIdx, data) {
+        async function handleServerMessage(srvIdx, data) {
             const srv = servers[srvIdx];
             if (!srv) return;
             const { msgType, payload } = P.unpackFrame(data);
@@ -750,12 +835,10 @@ createApp({
                     // Create digital signature instance with our DH private key
                     const signer = new DigitalSignature(dhPrivateKey.value, CURVE_NAME);
 
-                    // Convert challenge bytes to BigInt for signing
+                    // Domain-separated signing: prefix challenge with AUTH: to prevent cross-context forgery
                     const challengeHex = Array.from(wInfo.challenge, b => b.toString(16).padStart(2, '0')).join('');
-                    const challengeInt = BigInt('0x' + challengeHex);
-
-                    // Sign and send AUTH
-                    const [r, s] = signer.sign(challengeInt);
+                    const authPayload = `AUTH:${challengeHex}`;
+                    const [r, s] = await signer.signMessage(authPayload);
                     srv.ws.send(P.packAuth(r, s));
                     log(`[${srv.name}] >> AUTH sent`);
 
@@ -768,7 +851,7 @@ createApp({
                         for (let i = 0; i < msgList.length; i++) {
                             const m = msgList[i];
                             if (m.status === 'sending' && m.e_x) {
-                                retryItems.push({ destHex, msgIndex: i, e_x: m.e_x, e_parity: m.e_parity, j: m.j });
+                                retryItems.push({ destHex, msgIndex: i, e_x: m.e_x, e_parity: m.e_parity, j: m.j, ts: m.ts });
                             }
                         }
                     }
@@ -787,8 +870,12 @@ createApp({
                 case P.MSG_QUEUED: handleMsgStatus(payload, 'queued'); break;
                 case P.ERROR: {
                     const code = P.unpackError(payload);
-                    const names = { [P.ERR_USER_NOT_FOUND]: 'User not found', [P.ERR_INVALID_FRAME]: 'Invalid frame', [P.ERR_SESSION_EXPIRED]: 'Session expired' };
+                    const names = { [P.ERR_USER_NOT_FOUND]: 'User not found', [P.ERR_INVALID_FRAME]: 'Invalid frame', [P.ERR_SESSION_EXPIRED]: 'Session expired', [P.ERR_RATE_LIMITED]: 'Rate limited' };
                     log(`[${srv.name}] ERROR: ${names[code] || code}`);
+                    if (code === P.ERR_RATE_LIMITED) {
+                        srv._rateLimited = true;
+                        setTimeout(() => { srv._rateLimited = false; }, 2000);
+                    }
                     break;
                 }
                 case P.PEER_ONLINE: {
@@ -839,7 +926,9 @@ createApp({
                 sentMessageMap[sessionId] = { destHex: session.destHex, msgIndex: session.msgIndex, ts: Date.now() };
             }
             const retrySrvIdx = session.srvIdx;
+            const resolveCallback = session._resolve;
             delete pendingSendSessions[sessionId];
+            if (resolveCallback) resolveCallback();
             if (retrySrvIdx !== undefined) flushNextRetry(retrySrvIdx);
         }
 
@@ -856,9 +945,10 @@ createApp({
             const c1Point = srv.mo.encrypt(ePoint);
             const [c1X, c1Parity] = c1Point.compress();
 
-            // Re-sign with fresh timestamp for retry
-            const timestampMs = Date.now();
-            const sigPayload = `${ePoint.x.toString(16)}:${timestampMs}:${item.destHex}`;
+            // Use original timestamp — E was encrypted with deriveScalar(shared.x, originalTs, dest, j)
+            // Receiver needs the same ts to derive the same scalar for decryption
+            const timestampMs = item.ts;
+            const sigPayload = `${ePoint.x.toString(16)}:${item.e_parity}:${item.j}:${timestampMs}:${item.destHex}`;
             const signer = new DigitalSignature(dhPrivateKey.value, CURVE_NAME);
             const [sigR, sigS] = await signer.signMessage(sigPayload);
 
@@ -900,16 +990,43 @@ createApp({
             if (mp.timer) clearTimeout(mp.timer);
 
             let fullText = '';
+            let missingParts = 0;
             for (let i = 0; i < mp.total; i++) {
-                fullText += (mp.parts[i] !== undefined) ? mp.parts[i] : '';
+                if (mp.parts[i] !== undefined) {
+                    fullText += mp.parts[i];
+                } else {
+                    missingParts++;
+                }
+            }
+            if (missingParts > 0) {
+                log(`Multipart assembly: ${missingParts} missing parts out of ${mp.total}`);
+            }
+            // Validate base64 integrity for data URIs
+            if (fullText.startsWith('data:') && fullText.includes(';base64,')) {
+                const b64 = fullText.substring(fullText.indexOf(',') + 1);
+                try { atob(b64.substring(0, 100)); } catch (e) {
+                    log(`Multipart assembly: base64 CORRUPTED (${e.message}). ${mp.total} parts, ${fullText.length} chars`);
+                }
             }
 
             ensureContact(mp.senderHex);
             if (!messages[mp.senderHex]) messages[mp.senderHex] = [];
-            messages[mp.senderHex].push({
-                text: fullText, sent: false, time: mp.time, ts: mp.ts,
-                verified: mp.verified, nonce: true,
-            });
+
+            // Update the placeholder message instead of pushing a new one
+            if (mp.msgIndex !== undefined && messages[mp.senderHex][mp.msgIndex]) {
+                const msg = messages[mp.senderHex][mp.msgIndex];
+                msg.text = fullText;
+                msg.verified = mp.verified;
+                msg.nonce = true;
+                msg.time = mp.time;
+                msg.ts = mp.ts;
+                delete msg._receiving;
+            } else {
+                messages[mp.senderHex].push({
+                    text: fullText, sent: false, time: mp.time, ts: mp.ts,
+                    verified: mp.verified, nonce: true,
+                });
+            }
             saveMessages(mp.senderHex);
 
             const viewing = activeContact.value && activeContact.value.keyHex === mp.senderHex && view.value === 'chat';
@@ -939,7 +1056,7 @@ createApp({
             log(`[${srv.name}] MO decrypt: E = mo.decrypt(C3') (E.x: ${ePoint.x.toString(16).substring(0, 16)}...)`);
             const [recvEX, recvEParity] = ePoint.compress();
 
-            // Verify ECDSA signature on E.x:timestamp:dest (hashed internally by signMessage/verifyMessage)
+            // Verify ECDSA signature on E.x:eParity:j:timestamp:dest (hashed internally by verifyMessage)
             let verified = false;
             const senderPt = hexToPoint(session.senderHex);
             const senderPubKey = Point.decompress(senderPt.x, senderPt.parity, curve);
@@ -953,64 +1070,92 @@ createApp({
                 }
                 try {
                     const age = Date.now() - session.timestampMs;
-                    const MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
-                    if (age > MAX_AGE) {
-                        log(`[${srv.name}] ECDSA: message too old (${Math.round(age / 1000)}s), rejecting`);
+                    const MAX_AGE = REPLAY_MAX_AGE;
+                    const MAX_FUTURE = 60000; // 1 minute clock skew tolerance
+                    if (age > MAX_AGE || age < -MAX_FUTURE) {
+                        log(`[${srv.name}] ECDSA: timestamp out of window (age: ${Math.round(age / 1000)}s), rejecting`);
                     } else {
-                        const sigPayload = `${ePoint.x.toString(16)}:${session.timestampMs}:${myPubKeyHex.value}`;
+                        const sigPayload = `${ePoint.x.toString(16)}:${recvEParity}:${session.j}:${session.timestampMs}:${myPubKeyHex.value}`;
                         const verifier = new DigitalSignature(1n, CURVE_NAME);
                         verified = await verifier.verifyMessage(senderPubKey, sigPayload, session.sigR, session.sigS);
                         log(`[${srv.name}] ECDSA verify: ${verified ? 'VALID' : 'INVALID'} signature (age: ${Math.round(age / 1000)}s)`);
                         if (verified) {
-                            seenSignatures.add(sigFingerprint);
-                            // Prune old entries to prevent memory growth (keep last 10000)
-                            if (seenSignatures.size > 10000) {
-                                const first = seenSignatures.values().next().value;
-                                seenSignatures.delete(first);
+                            const now = Date.now();
+                            seenSignatures.set(sigFingerprint, now);
+                            // Prune expired entries to prevent memory growth
+                            for (const [fp, ts] of seenSignatures) {
+                                if (now - ts > REPLAY_MAX_AGE) seenSignatures.delete(fp);
                             }
+                            persistReplayGuard();
                         }
                     }
                 } catch (e) {
                     log(`[${srv.name}] ECDSA verify error: ${e.message}`);
                 }
             } else {
-                log(`[${srv.name}] No signature attached (unsigned message)`);
+                log(`[${srv.name}] No signature attached, dropping message`);
+                delete pendingRecvSessions[sessionId];
+                return;
+            }
+
+            // Drop unverified messages silently
+            if (!verified) {
+                log(`[${srv.name}] Signature verification failed, dropping message`);
+                delete pendingRecvSessions[sessionId];
+                return;
             }
 
             const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
             const shared = dh.computeSharedSecret(senderPubKey);
-            log(`[${srv.name}] DH shared secret computed (x: ${shared.x.toString(16).substring(0, 16)}...)`);
-            const invX = modInverse(shared.x, curve.n);
-            const mPoint = ePoint.mul(invX);
-            log(`[${srv.name}] DH decrypt: M = E * shared.x⁻¹ (M.x: ${mPoint.x.toString(16).substring(0, 16)}...)`);
+            const scalar = await deriveScalar(shared.x, session.timestampMs, myPubKeyHex.value, session.j);
+            log(`[${srv.name}] DH + HKDF(ts:dest:j) → scalar (${scalar.toString(16).substring(0, 16)}...)`);
+            const invScalar = modInverse(scalar, curve.n);
+            const mPoint = ePoint.mul(invScalar);
+            log(`[${srv.name}] DH decrypt: M = E * scalar⁻¹ (M.x: ${mPoint.x.toString(16).substring(0, 16)}...)`);
             const paddedText = koblitz.decode(mPoint, session.j);
             // Strip the 4-char nonce prefix
             const text = paddedText.length > NONCE_LEN ? paddedText.substring(NONCE_LEN) : paddedText;
             log(`[${srv.name}] Koblitz decode: stripped nonce → "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}" (j=${session.j})`);
 
-            // Check for multipart header: \x01 + 2-char groupId + 1-char partIdx(base36) + 1-char total(base36)
+            // Check for multipart header: \x01 + 8-char groupId + 3-char partIdx(padded base36) + 3-char total(padded base36)
             if (text.length >= MULTIPART_HEADER_LEN && text.charAt(0) === MULTIPART_MARKER) {
-                const partIdx = parseInt(text.charAt(3), 36);
-                const total = parseInt(text.charAt(4), 36);
+                const groupId = text.substring(1, 9);
+                const partIdx = parseInt(text.substring(9, 12), 36);
+                const total = parseInt(text.substring(12, 15), 36);
                 if (!isNaN(partIdx) && !isNaN(total) && total > 1 && partIdx < total) {
-                    const groupId = text.substring(1, 3);
                     const content = text.substring(MULTIPART_HEADER_LEN);
                     const key = session.senderHex + ':' + groupId;
 
                     if (!pendingMultiparts[key]) {
+                        ensureContact(session.senderHex);
+                        if (!messages[session.senderHex]) messages[session.senderHex] = [];
+                        const placeholderIdx = messages[session.senderHex].length;
+                        messages[session.senderHex].push({
+                            text: `Receiving 1/${total}...`, sent: false,
+                            time: new Date().toLocaleTimeString(), ts: Date.now(),
+                            verified: true, _receiving: true,
+                        });
+                        scrollMessages();
                         pendingMultiparts[key] = {
                             total, parts: {}, verified: true,
                             senderHex: session.senderHex,
                             time: new Date().toLocaleTimeString(), ts: Date.now(),
+                            msgIndex: placeholderIdx,
                         };
                     }
                     const mp = pendingMultiparts[key];
                     mp.parts[partIdx] = content;
                     if (!verified) mp.verified = false;
 
+                    // Update placeholder with progress
+                    const received = Object.keys(mp.parts).length;
+                    if (messages[mp.senderHex] && messages[mp.senderHex][mp.msgIndex]) {
+                        messages[mp.senderHex][mp.msgIndex].text = `Receiving ${received}/${total}...`;
+                    }
+
                     // Reset timeout for incomplete multiparts
                     if (mp.timer) clearTimeout(mp.timer);
-                    mp.timer = setTimeout(() => flushMultipart(key, true), 30000);
+                    mp.timer = setTimeout(() => flushMultipart(key, true), 300000);
 
                     log(`[${srv.name}] Multipart chunk ${partIdx + 1}/${total} (group: ${groupId}) from ${session.senderHex.substring(0, 16)}...`);
 
@@ -1029,6 +1174,7 @@ createApp({
             if (!messages[session.senderHex]) messages[session.senderHex] = [];
             messages[session.senderHex].push({
                 text, sent: false, time: new Date().toLocaleTimeString(), ts: Date.now(),
+                sigTs: session.timestampMs, // original sender timestamp for HKDF re-derivation
                 verified, nonce: true,
                 e_x: recvEX.toString(16), e_parity: Number(recvEParity), j: session.j,
             });
@@ -1040,7 +1186,7 @@ createApp({
             delete pendingRecvSessions[sessionId];
             const c = contacts.find(c => c.keyHex === session.senderHex);
             const senderName = c ? c.nickname : session.senderHex.substring(0, 16) + '...';
-            log(`[${srv.name}] Message received from ${senderName} (j=${session.j}, ${text.length} chars, ${verified ? 'verified' : 'unverified'}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+            log(`[${srv.name}] Message received from ${senderName} (j=${session.j}, ${text.length} chars, verified): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
             notifyNewMessage(senderName, text);
             scrollMessages();
         }
@@ -1086,14 +1232,24 @@ createApp({
         const NONCE_LEN = 4;
         const KOBLITZ_MAX = 51; // secp521r1 Koblitz limit (55) minus nonce prefix
         const MULTIPART_MARKER = '\x01';
-        const MULTIPART_HEADER_LEN = 5; // \x01 + 2-char groupId + 1-char partIdx(base36) + 1-char total(base36)
-        const MULTIPART_KOBLITZ_MAX = KOBLITZ_MAX - MULTIPART_HEADER_LEN; // 46
-        const MAX_MESSAGE_LENGTH = 36 * MULTIPART_KOBLITZ_MAX; // max parts(base36) * chars per part
+        const MULTIPART_HEADER_LEN = 15; // \x01 + 8-char groupId + 3-char partIdx(base36) + 3-char total(base36)
+        const MULTIPART_KOBLITZ_MAX = KOBLITZ_MAX - MULTIPART_HEADER_LEN; // 36
+        const MAX_MULTIPART_PARTS = 46656; // 36^3
+        const MAX_MESSAGE_LENGTH = 36 * MULTIPART_KOBLITZ_MAX; // text input cap (1512)
+        const MAX_MEDIA_LENGTH = MAX_MULTIPART_PARTS * MULTIPART_KOBLITZ_MAX; // 1959552
         const maxMessageLength = ref(MAX_MESSAGE_LENGTH);
 
+        // Send semaphore — ensures only one chunk is in-flight at a time
+        let sendQueueTail = Promise.resolve();
+        function enqueueSend(fn) {
+            sendQueueTail = sendQueueTail.then(fn, fn);
+            return sendQueueTail;
+        }
+
         function generateGroupId() {
-            const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-            return chars[Math.floor(Math.random() * 36)] + chars[Math.floor(Math.random() * 36)];
+            const bytes = new Uint8Array(4);
+            crypto.getRandomValues(bytes);
+            return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
         }
 
         /** Split text into chunks <= max, breaking at spaces when possible. */
@@ -1111,51 +1267,280 @@ createApp({
             return parts;
         }
 
-        async function sendChunk(chunkText, destHex, srvIdx, multipartMsgIndex) {
-            const srv = servers[srvIdx];
-            // Prepend random nonce to make encryption non-deterministic
-            const nonce = generateNonce();
-            const paddedText = nonce + chunkText;
-            const [mPoint, j] = koblitz.encode(paddedText);
-            log(`Koblitz encode: nonce="${nonce}" + "${chunkText.substring(0, 26)}${chunkText.length > 26 ? '...' : ''}" → point (j=${j})`);
-            const destPt = hexToPoint(destHex);
-            const destPubKey = Point.decompress(destPt.x, destPt.parity, curve);
-            const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
-            const shared = dh.computeSharedSecret(destPubKey);
-            log(`DH shared secret computed (x: ${shared.x.toString(16).substring(0, 16)}...)`);
-            const ePoint = mPoint.mul(shared.x);
-            log(`DH encrypt: E = M * shared.x (E.x: ${ePoint.x.toString(16).substring(0, 16)}...)`);
-
-            // Sign SHA-256(E.x || timestamp || destHex) for anti-replay
-            const timestampMs = Date.now();
-            const sigPayload = `${ePoint.x.toString(16)}:${timestampMs}:${destHex}`;
-            const signer = new DigitalSignature(dhPrivateKey.value, CURVE_NAME);
-            const [sigR, sigS] = await signer.signMessage(sigPayload);
-            log(`ECDSA sign: sig(E.x:ts:dest) = (r: ${sigR.toString(16).substring(0, 12)}..., s: ${sigS.toString(16).substring(0, 12)}...)`);
-
-            const c1Point = srv.mo.encrypt(ePoint);
-            log(`MO encrypt: C1 = mo.encrypt(E) (C1.x: ${c1Point.x.toString(16).substring(0, 16)}...)`);
-            const [c1X, c1Parity] = c1Point.compress();
-            const [eX, eParity] = ePoint.compress();
-
-            let msgIndex;
-            if (multipartMsgIndex !== undefined) {
-                msgIndex = multipartMsgIndex;
-            } else {
-                if (!messages[destHex]) messages[destHex] = [];
-                msgIndex = messages[destHex].length;
-                messages[destHex].push({ text: chunkText, sent: true, time: new Date().toLocaleTimeString(), ts: timestampMs, status: 'sending', e_x: eX.toString(16), e_parity: Number(eParity), j, nonce: true });
-                saveMessages(destHex);
+        /** Strict split for binary/media data — exact character boundaries, no trimming. */
+        function splitMedia(text, max) {
+            const parts = [];
+            for (let i = 0; i < text.length; i += max) {
+                parts.push(text.substring(i, i + max));
             }
-
-            if (!pendingSendQueues[srvIdx]) pendingSendQueues[srvIdx] = [];
-            pendingSendQueues[srvIdx].push({ moInstance: srv.mo, destHex, j, msgIndex, srvIdx });
-
-            log(`[${srv.name}] >> MO_SEND_INIT to ${activeContact.value.nickname} (j=${j}, ${chunkText.length} chars, signed)`);
-            srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, j, c1X, c1Parity, sigR, sigS, timestampMs));
+            return parts;
         }
 
-        function sendMessage() {
+        function sendChunk(chunkText, destHex, srvIdx, multipartMsgIndex) {
+            return new Promise(async (resolve) => {
+                const srv = servers[srvIdx];
+                // Wait if server signaled rate limiting
+                while (srv._rateLimited) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+                // Prepend random nonce to make encryption non-deterministic
+                const nonce = generateNonce();
+                const paddedText = nonce + chunkText;
+                const [mPoint, j] = koblitz.encode(paddedText);
+                // Verify Koblitz round-trip integrity
+                const roundTrip = koblitz.decode(mPoint, j);
+                if (roundTrip !== paddedText) {
+                    log(`KOBLITZ CORRUPTION: encode/decode mismatch! expected ${paddedText.length} chars, got ${roundTrip.length} chars`);
+                    log(`  First diff at char ${[...paddedText].findIndex((c, i) => c !== roundTrip[i])}`);
+                }
+                log(`Koblitz encode: nonce="${nonce}" + "${chunkText.substring(0, 26)}${chunkText.length > 26 ? '...' : ''}" → point (j=${j})`);
+                const destPt = hexToPoint(destHex);
+                const destPubKey = Point.decompress(destPt.x, destPt.parity, curve);
+                const timestampMs = Date.now();
+                const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
+                const shared = dh.computeSharedSecret(destPubKey);
+                const scalar = await deriveScalar(shared.x, timestampMs, destHex, j);
+                log(`DH + HKDF(ts:dest:j) → scalar (${scalar.toString(16).substring(0, 16)}...)`);
+                const ePoint = mPoint.mul(scalar);
+                log(`DH encrypt: E = M * scalar (E.x: ${ePoint.x.toString(16).substring(0, 16)}...)`);
+
+                // Compress E before signing so eParity is included in the payload
+                const [eX, eParity] = ePoint.compress();
+
+                // Sign E.x:eParity:j:timestamp:destHex for anti-replay and integrity (signMessage hashes internally)
+                const sigPayload = `${ePoint.x.toString(16)}:${eParity}:${j}:${timestampMs}:${destHex}`;
+                const signer = new DigitalSignature(dhPrivateKey.value, CURVE_NAME);
+                const [sigR, sigS] = await signer.signMessage(sigPayload);
+                log(`ECDSA sign: sig(E.x:eParity:j:ts:dest) = (r: ${sigR.toString(16).substring(0, 12)}..., s: ${sigS.toString(16).substring(0, 12)}...)`);
+
+                const c1Point = srv.mo.encrypt(ePoint);
+                log(`MO encrypt: C1 = mo.encrypt(E) (C1.x: ${c1Point.x.toString(16).substring(0, 16)}...)`);
+                const [c1X, c1Parity] = c1Point.compress();
+
+                let msgIndex;
+                if (multipartMsgIndex !== undefined) {
+                    msgIndex = multipartMsgIndex;
+                } else {
+                    if (!messages[destHex]) messages[destHex] = [];
+                    msgIndex = messages[destHex].length;
+                    messages[destHex].push({ text: chunkText, sent: true, time: new Date().toLocaleTimeString(), ts: timestampMs, status: 'sending', e_x: eX.toString(16), e_parity: Number(eParity), j, nonce: true });
+                    saveMessages(destHex);
+                }
+
+                if (!pendingSendQueues[srvIdx]) pendingSendQueues[srvIdx] = [];
+                pendingSendQueues[srvIdx].push({ moInstance: srv.mo, destHex, j, msgIndex, srvIdx, _resolve: resolve });
+
+                log(`[${srv.name}] >> MO_SEND_INIT to ${activeContact.value.nickname} (j=${j}, ${chunkText.length} chars, signed)`);
+                srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, j, c1X, c1Parity, sigR, sigS, timestampMs));
+            });
+        }
+
+        // === MEDIA HELPERS ===
+        const fileInput = ref(null);
+
+        function isMediaMessage(text) { return text && text.startsWith('data:'); }
+        function isImageMsg(text) { return text && text.startsWith('data:image/'); }
+        function isAudioMsg(text) { return text && text.startsWith('data:audio/'); }
+        function isVideoMsg(text) { return text && text.startsWith('data:video/'); }
+
+        // Convert data URI to Blob URL for reliable media playback
+        // Large data URIs in src attributes fail in many browsers
+        const blobUrlCache = new Map();
+        function dataUriToBlobUrl(dataUri) {
+            const cacheKey = dataUri.length + ':' + dataUri.substring(0, 80);
+            if (blobUrlCache.has(cacheKey)) return blobUrlCache.get(cacheKey);
+            try {
+                const commaIdx = dataUri.indexOf(',');
+                if (commaIdx < 0) return dataUri;
+                const header = dataUri.substring(0, commaIdx);
+                const base64Data = dataUri.substring(commaIdx + 1);
+                // Capture full MIME type with parameters (e.g. audio/webm;codecs=opus)
+                const mimeMatch = header.match(/data:(.+);base64/);
+                const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+                const binary = atob(base64Data);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                const blob = new Blob([bytes], { type: mime });
+                const url = URL.createObjectURL(blob);
+                blobUrlCache.set(cacheKey, url);
+                return url;
+            } catch (e) {
+                log(`Blob URL conversion failed: ${e.message}`);
+                return dataUri;
+            }
+        }
+
+        // For images: auto-convert on render (small, fast)
+        function mediaSrc(dataUri) {
+            if (!dataUri || !dataUri.startsWith('data:')) return dataUri;
+            return dataUriToBlobUrl(dataUri);
+        }
+
+        // For audio/video: lazy load — only convert when user clicks
+        function loadMedia(msg) {
+            if (msg._blobUrl) return;
+            const url = dataUriToBlobUrl(msg.text);
+            if (url && url.startsWith('blob:')) {
+                msg._blobUrl = url;
+            } else {
+                // Blob conversion failed (corrupt data) — show error
+                msg._blobUrl = 'error';
+                log(`Media corrupted: could not decode base64 (${msg.text.length} chars)`);
+            }
+        }
+
+        function triggerFileInput() {
+            if (fileInput.value) fileInput.value.click();
+        }
+
+        function compressImage(file, maxWidth, quality) {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = () => {
+                    const scale = Math.min(1, maxWidth / img.width);
+                    const w = Math.round(img.width * scale);
+                    const h = Math.round(img.height * scale);
+                    const canvas = document.createElement('canvas');
+                    canvas.width = w;
+                    canvas.height = h;
+                    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+                    resolve(canvas.toDataURL('image/jpeg', quality));
+                };
+                img.onerror = reject;
+                img.src = URL.createObjectURL(file);
+            });
+        }
+
+        function fileToDataUri(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
+        async function sendMediaMessage(dataUri, destHex, srvIdx) {
+            const parts = splitMedia(dataUri, MULTIPART_KOBLITZ_MAX);
+            if (parts.length > MAX_MULTIPART_PARTS) {
+                log(`Media too large: ${parts.length} parts needed (max ${MAX_MULTIPART_PARTS})`);
+                return;
+            }
+            const groupId = generateGroupId();
+            const total = parts.length;
+            log(`Media message: ${dataUri.length} chars, ${total} parts (group: ${groupId})`);
+
+            if (!messages[destHex]) messages[destHex] = [];
+            const msgIndex = messages[destHex].length;
+            messages[destHex].push({
+                text: dataUri, sent: true, time: new Date().toLocaleTimeString(),
+                ts: Date.now(), status: 'sending',
+                _multipartTotal: total, _multipartDone: 0,
+            });
+            saveMessages(destHex);
+            scrollMessages();
+
+            for (let i = 0; i < total; i++) {
+                const header = MULTIPART_MARKER + groupId + i.toString(36).padStart(3, '0') + total.toString(36).padStart(3, '0');
+                await enqueueSend(() => sendChunk(header + parts[i], destHex, srvIdx, msgIndex));
+            }
+        }
+
+        async function handleFileSelect(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+            if (fileInput.value) fileInput.value.value = '';
+            if (!activeContact.value) { log('No active contact selected'); return; }
+
+            const destHex = activeContact.value.keyHex;
+            const srvIdx = findServerForPeer(destHex);
+            if (srvIdx < 0) { log('No connected server available'); return; }
+
+            let dataUri;
+            try {
+                if (file.type.startsWith('image/')) {
+                    dataUri = await compressImage(file, 150, 0.4);
+                    log(`Image compressed: ${file.name} → ${dataUri.length} chars`);
+                } else if (file.type.startsWith('video/') || file.type.startsWith('audio/')) {
+                    dataUri = await fileToDataUri(file);
+                    log(`Media file: ${file.name} → ${dataUri.length} chars`);
+                } else {
+                    log(`Unsupported file type: ${file.type}`);
+                    return;
+                }
+            } catch (err) {
+                log(`File read error: ${err.message}`);
+                return;
+            }
+
+            if (dataUri.length > MAX_MEDIA_LENGTH) {
+                log(`File too large: ${dataUri.length} chars (max ${MAX_MEDIA_LENGTH}). Try a smaller file.`);
+                return;
+            }
+
+            sendMediaMessage(dataUri, destHex, srvIdx);
+        }
+
+        // === AUDIO RECORDING ===
+        const isRecording = ref(false);
+        let mediaRecorder = null;
+        let recordedChunks = [];
+
+        function toggleRecording() {
+            if (!activeContact.value) { log('No active contact selected'); return; }
+            if (isRecording.value) {
+                // Stop recording
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                    mediaRecorder.stop();
+                }
+                isRecording.value = false;
+                return;
+            }
+
+            // Start recording
+            navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+                recordedChunks = [];
+                let options;
+                try {
+                    options = { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 8000 };
+                    mediaRecorder = new MediaRecorder(stream, options);
+                } catch (e) {
+                    options = { mimeType: 'audio/webm', audioBitsPerSecond: 8000 };
+                    mediaRecorder = new MediaRecorder(stream, options);
+                }
+
+                mediaRecorder.ondataavailable = (e) => {
+                    if (e.data.size > 0) recordedChunks.push(e.data);
+                };
+
+                mediaRecorder.onstop = () => {
+                    stream.getTracks().forEach(t => t.stop());
+                    const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType });
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                        const dataUri = reader.result;
+                        if (dataUri.length > MAX_MEDIA_LENGTH) {
+                            log(`Voice message too large: ${dataUri.length} chars (max ${MAX_MEDIA_LENGTH})`);
+                            return;
+                        }
+                        const destHex = activeContact.value.keyHex;
+                        const srvIdx = findServerForPeer(destHex);
+                        if (srvIdx < 0) { log('No connected server available'); return; }
+                        log(`Voice message: ${dataUri.length} chars`);
+                        sendMediaMessage(dataUri, destHex, srvIdx);
+                    };
+                    reader.readAsDataURL(blob);
+                };
+
+                mediaRecorder.start();
+                isRecording.value = true;
+                log('Recording audio...');
+            }).catch((err) => {
+                log(`Microphone access denied: ${err.message}`);
+            });
+        }
+
+        async function sendMessage() {
             if (!messageInput.value.trim() || !activeContact.value) return;
             const text = messageInput.value.trim();
             const destHex = activeContact.value.keyHex;
@@ -1163,8 +1548,11 @@ createApp({
             const srvIdx = findServerForPeer(destHex);
             if (srvIdx < 0) { log('No connected server available'); return; }
 
+            messageInput.value = '';
+            scrollMessages();
+
             if (text.length <= KOBLITZ_MAX) {
-                sendChunk(text, destHex, srvIdx);
+                await enqueueSend(() => sendChunk(text, destHex, srvIdx));
             } else {
                 const groupId = generateGroupId();
                 const parts = splitText(text, MULTIPART_KOBLITZ_MAX);
@@ -1182,13 +1570,10 @@ createApp({
                 saveMessages(destHex);
 
                 for (let i = 0; i < total; i++) {
-                    const header = MULTIPART_MARKER + groupId + i.toString(36) + total.toString(36);
-                    sendChunk(header + parts[i], destHex, srvIdx, msgIndex);
+                    const header = MULTIPART_MARKER + groupId + i.toString(36).padStart(3, '0') + total.toString(36).padStart(3, '0');
+                    await enqueueSend(() => sendChunk(header + parts[i], destHex, srvIdx, msgIndex));
                 }
             }
-
-            messageInput.value = '';
-            scrollMessages();
         }
 
         // === SERVER MANAGEMENT ===
@@ -1226,6 +1611,14 @@ createApp({
             const nick = newContactNick.value.trim();
             const key = newContactKey.value.trim();
             if (!nick || !key || !key.includes(':')) { log('Invalid contact'); return; }
+            // Validate that the key is a valid point on the curve
+            try {
+                const pt = hexToPoint(key);
+                Point.decompress(pt.x, pt.parity, curve);
+            } catch (e) {
+                log(`Invalid public key: ${e.message}`);
+                return;
+            }
             if (contacts.find(c => c.keyHex === key)) { log('Contact already exists'); return; }
             contacts.push({ nickname: nick, keyHex: key });
             saveContacts();
@@ -1236,7 +1629,14 @@ createApp({
 
         function removeContact(index) {
             const c = contacts[index];
-            log(`Contact removed: ${c.nickname}`);
+            // Purge all message history for this contact
+            delete messages[c.keyHex];
+            idbDel('messages', c.keyHex).catch(() => {});
+            // Remove any pending multiparts from this contact
+            for (const key of Object.keys(pendingMultiparts)) {
+                if (key.startsWith(c.keyHex + ':')) delete pendingMultiparts[key];
+            }
+            log(`Contact removed: ${c.nickname} (messages purged)`);
             contacts.splice(index, 1);
             saveContacts();
             if (activeContact.value && activeContact.value.keyHex === c.keyHex) activeContact.value = null;
@@ -1294,7 +1694,9 @@ createApp({
             screen, view, showServers, nickname, status, logs,
             compressedPubKeyDisplay, copied,
             servers, contacts, activeContact, activeMessages,
-            messageInput, maxMessageLength, messagesEl, logEl,
+            messageInput, maxMessageLength, messagesEl, logEl, fileInput,
+            handleFileSelect, triggerFileInput, isImageMsg, isAudioMsg, isVideoMsg, mediaSrc, loadMedia,
+            isRecording, toggleRecording,
             newContactNick, newContactKey, editingContact,
             newServerName, newServerUrl, showAddContact, showAddServer,
             logHeight,

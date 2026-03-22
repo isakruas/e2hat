@@ -18,7 +18,7 @@ when subsequent frames arrive.
 
 import os
 import struct
-import threading
+import time
 
 # Session states
 WAIT_STEP3 = "WAIT_STEP3"            # Sender session: waiting for client's step 3
@@ -26,7 +26,7 @@ WAIT_RECV_STEP2 = "WAIT_RECV_STEP2"  # Receiver session: waiting for receiver's 
 
 
 class SessionManager:
-    """Thread-safe manager for active Massey-Omura sessions.
+    """Async-safe manager for active Massey-Omura sessions.
 
     Sessions are short-lived: created when a 3-pass exchange starts and removed
     as soon as it completes. The random session ID is returned to the client so
@@ -35,7 +35,6 @@ class SessionManager:
 
     def __init__(self):
         self._sessions = {}
-        self._lock = threading.Lock()
 
     def _random_sid(self):
         """Generate a random 4-byte session ID, avoiding zero and collisions."""
@@ -49,14 +48,14 @@ class SessionManager:
 
         Keyword arguments are stored as metadata (sender, dest, j, MO instances, etc.)
         """
-        with self._lock:
-            sid = self._random_sid()
-            self._sessions[sid] = {
-                "id": sid,
-                "state": WAIT_STEP3,
-                "metadata": metadata,
-            }
-            return sid
+        sid = self._random_sid()
+        self._sessions[sid] = {
+            "id": sid,
+            "state": WAIT_STEP3,
+            "metadata": metadata,
+            "created_at": time.time(),
+        }
+        return sid
 
     def get(self, session_id):
         """Look up a session by ID. Returns None if not found."""
@@ -71,6 +70,17 @@ class SessionManager:
     def remove(self, session_id):
         """Remove a completed or expired session."""
         self._sessions.pop(session_id, None)
+
+    def purge_stale(self, max_age=30):
+        """Remove sessions older than max_age seconds."""
+        now = time.time()
+        stale = [
+            sid for sid, sess in self._sessions.items()
+            if now - sess.get("created_at", 0) > max_age
+        ]
+        for sid in stale:
+            self._sessions.pop(sid, None)
+        return len(stale)
 
     def cleanup_for_client(self, pubkey_hex):
         """Remove all sessions involving a disconnected client.

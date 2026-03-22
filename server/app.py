@@ -5,6 +5,7 @@ using the Massey-Omura 3-pass protocol. It never has access to plaintext
 messages or to the Diffie-Hellman shared secrets used for message encryption.
 """
 
+import asyncio
 import logging
 import os
 import secrets
@@ -23,6 +24,27 @@ CURVE_NAME = "secp521r1"
 curve = get_curve(CURVE_NAME)
 QUEUE_TTL = 86400  # 24 hours in seconds
 MAX_QUEUE_PER_USER = 100  # Max queued messages per offline user
+MAX_DESTS_PER_SENDER = 500  # Max distinct offline destinations per sender
+RATE_LIMIT_WINDOW = 10  # seconds
+RATE_LIMIT_MAX = 200  # max messages per window per connection
+
+
+_rate_limits = {}  # pubkey_hex -> list of timestamps
+
+
+def _check_rate_limit(pubkey_hex):
+    """Return True if the connection is within rate limits, False if exceeded."""
+    if not pubkey_hex:
+        return False
+    now = time.time()
+    timestamps = _rate_limits.setdefault(pubkey_hex, [])
+    # Prune old entries
+    cutoff = now - RATE_LIMIT_WINDOW
+    _rate_limits[pubkey_hex] = timestamps = [t for t in timestamps if t > cutoff]
+    if len(timestamps) >= RATE_LIMIT_MAX:
+        return False
+    timestamps.append(now)
+    return True
 
 
 def _pubkey_hex(x, parity):
@@ -55,29 +77,36 @@ async def websocket_handler(request):
                     await ws.send_bytes(proto.pack_error(proto.ERR_INVALID_FRAME))
                     continue
 
-                if msg_type == proto.HELLO:
-                    await _handle_hello(app, ws, payload)
+                try:
+                    if msg_type == proto.HELLO:
+                        await _handle_hello(app, ws, payload)
 
-                elif msg_type == proto.AUTH:
-                    client_pubkey_hex = await _handle_auth(app, ws, payload)
+                    elif msg_type == proto.AUTH:
+                        client_pubkey_hex = await _handle_auth(app, ws, payload)
 
-                elif msg_type == proto.MO_SEND_INIT:
-                    await _handle_mo_send_init(app, ws, payload, client_pubkey_hex)
+                    elif msg_type == proto.MO_SEND_INIT:
+                        if not _check_rate_limit(client_pubkey_hex):
+                            await ws.send_bytes(proto.pack_error(proto.ERR_RATE_LIMITED))
+                            continue
+                        await _handle_mo_send_init(app, ws, payload, client_pubkey_hex)
 
-                elif msg_type == proto.MO_SEND_STEP3:
-                    await _handle_mo_send_step3(app, ws, payload)
+                    elif msg_type == proto.MO_SEND_STEP3:
+                        await _handle_mo_send_step3(app, ws, payload, client_pubkey_hex)
 
-                elif msg_type == proto.MO_RECV_STEP2:
-                    await _handle_mo_recv_step2(app, ws, payload)
+                    elif msg_type == proto.MO_RECV_STEP2:
+                        await _handle_mo_recv_step2(app, ws, payload, client_pubkey_hex)
 
-                else:
+                    else:
+                        await ws.send_bytes(proto.pack_error(proto.ERR_INVALID_FRAME))
+                except Exception as exc:
+                    log.exception("Handler error (msg_type=%s): %s", msg_type, exc)
                     await ws.send_bytes(proto.pack_error(proto.ERR_INVALID_FRAME))
 
             elif msg.type == web.WSMsgType.ERROR:
                 log.error("WS error: %s", ws.exception())
     finally:
         if client_pubkey_hex:
-            _handle_disconnect(app, client_pubkey_hex)
+            await _handle_disconnect(app, client_pubkey_hex)
 
     return ws
 
@@ -120,14 +149,15 @@ async def _handle_auth(app, ws, payload):
         from ecutils import DigitalSignature
         r, s = proto.unpack_auth(payload)
 
-        # The message signed is the 32-byte challenge
-        challenge_int = int.from_bytes(h["challenge"], "big")
+        # Domain-separated verification: AUTH:<challenge_hex>
+        challenge_hex = h["challenge"].hex()
+        auth_payload = f"AUTH:{challenge_hex}".encode()
 
         pubkey = Point.decompress(h["pubkey_x"], h["pubkey_parity"], curve)
 
-        # verify() only uses the curve parameters, not the private key
+        # verify_message hashes the payload internally
         signer = DigitalSignature(1, CURVE_NAME)
-        if not signer.verify(pubkey, challenge_int, r, s):
+        if not signer.verify_message(pubkey, auth_payload, r, s):
             raise ValueError("Invalid ECDSA signature")
 
     except Exception as e:
@@ -187,12 +217,18 @@ async def _handle_mo_send_init(app, ws, payload, sender_hex):
     await ws.send_bytes(proto.pack_mo_send_step2(sid, c2_x, c2_parity))
 
 
-async def _handle_mo_send_step3(app, ws, payload):
+async def _handle_mo_send_step3(app, ws, payload, client_pubkey_hex):
+    if not client_pubkey_hex:
+        await ws.send_bytes(proto.pack_error(proto.ERR_INVALID_FRAME))
+        return
     session_id, c3_x, c3_parity = proto.unpack_mo_send_step3(payload)
     sessions = app["sessions"]
     session = sessions.get(session_id)
     if not session or session["state"] != WAIT_STEP3:
         await ws.send_bytes(proto.pack_error(proto.ERR_SESSION_EXPIRED))
+        return
+    if session["metadata"]["sender"] != client_pubkey_hex:
+        await ws.send_bytes(proto.pack_error(proto.ERR_INVALID_FRAME))
         return
 
     server_mo = session["metadata"]["server_mo_sender"]
@@ -220,6 +256,12 @@ async def _initiate_delivery(
     dest_info = app["clients"].get(dest_hex)
 
     if not dest_info:
+        # Per-sender limit: prevent one sender from creating queues to unlimited destinations
+        sender_dests = app["queue_owners"].setdefault(sender_hex, set())
+        if dest_hex not in app["queues"] and dest_hex not in sender_dests:
+            if len(sender_dests) >= MAX_DESTS_PER_SENDER:
+                log.warning("Sender %s... hit dest queue limit, dropping", sender_hex[:20])
+                return
         queue = app["queues"].setdefault(dest_hex, [])
         if len(queue) >= MAX_QUEUE_PER_USER:
             queue.pop(0)  # Drop oldest to make room
@@ -229,6 +271,7 @@ async def _initiate_delivery(
             "send_sid": send_sid, "queued_at": queued_at or time.time(),
             "sig_r": sig_r, "sig_s": sig_s, "timestamp_ms": timestamp_ms,
         })
+        sender_dests.add(dest_hex)
         if send_sid is not None:
             sender_info = app["clients"].get(sender_hex)
             if sender_info:
@@ -253,12 +296,18 @@ async def _initiate_delivery(
     )
 
 
-async def _handle_mo_recv_step2(app, ws, payload):
+async def _handle_mo_recv_step2(app, ws, payload, client_pubkey_hex):
+    if not client_pubkey_hex:
+        await ws.send_bytes(proto.pack_error(proto.ERR_INVALID_FRAME))
+        return
     session_id, c2_x, c2_parity = proto.unpack_mo_recv_step2(payload)
     sessions = app["sessions"]
     session = sessions.get(session_id)
     if not session or session["state"] != WAIT_RECV_STEP2:
         await ws.send_bytes(proto.pack_error(proto.ERR_SESSION_EXPIRED))
+        return
+    if session["metadata"]["dest"] != client_pubkey_hex:
+        await ws.send_bytes(proto.pack_error(proto.ERR_INVALID_FRAME))
         return
 
     server_mo = session["metadata"]["server_mo_receiver"]
@@ -284,6 +333,9 @@ async def _handle_mo_recv_step2(app, ws, payload):
 async def _deliver_queued(app, pubkey_hex):
     now = time.time()
     queue = app["queues"].pop(pubkey_hex, [])
+    # Clean up queue_owners references to this dest
+    for sender_hex, dests in app["queue_owners"].items():
+        dests.discard(pubkey_hex)
     for item in queue:
         queued_at = item.get("queued_at", now)
         if now - queued_at > QUEUE_TTL:
@@ -297,21 +349,18 @@ async def _deliver_queued(app, pubkey_hex):
         )
 
 
-def _handle_disconnect(app, pubkey_hex):
+async def _handle_disconnect(app, pubkey_hex):
     app["clients"].pop(pubkey_hex, None)
     requeue_items = app["sessions"].cleanup_for_client(pubkey_hex)
     for item in requeue_items:
         app["queues"].setdefault(item["dest"], []).append(item)
 
     x, parity = _parse_pubkey_hex(pubkey_hex)
-    import asyncio
+    notify = []
     for _other_hex, other_info in app["clients"].items():
-        try:
-            asyncio.ensure_future(
-                other_info["ws"].send_bytes(proto.pack_peer_offline(x, parity))
-            )
-        except Exception:  # noqa: S110
-            pass
+        notify.append(other_info["ws"].send_bytes(proto.pack_peer_offline(x, parity)))
+    if notify:
+        await asyncio.gather(*notify, return_exceptions=True)
     log.info("Client disconnected: %s...", pubkey_hex[:20])
 
 
@@ -320,12 +369,39 @@ def _parse_pubkey_hex(pubkey_hex):
     return int(parts[0], 16), int(parts[1])
 
 
+async def _purge_stale_sessions(app):
+    """Periodically purge stale MO sessions and expired rate limit entries."""
+    while True:
+        await asyncio.sleep(30)
+        purged = app["sessions"].purge_stale(max_age=30)
+        if purged:
+            log.info("Purged %d stale session(s)", purged)
+        # Purge expired rate limit entries
+        cutoff = time.time() - RATE_LIMIT_WINDOW
+        stale_keys = [k for k, ts in _rate_limits.items() if not ts or ts[-1] < cutoff]
+        for k in stale_keys:
+            del _rate_limits[k]
+
+
+async def _on_startup(app):
+    app["_purge_task"] = asyncio.create_task(_purge_stale_sessions(app))
+
+
+async def _on_cleanup(app):
+    task = app.get("_purge_task")
+    if task:
+        task.cancel()
+
+
 def create_app():
     app = web.Application()
     app["clients"] = {}
     app["sessions"] = SessionManager()
     app["queues"] = {}
+    app["queue_owners"] = {}  # sender_hex -> set of dest_hexes they queued to
     app.router.add_get("/ws", websocket_handler)
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
     return app
 
 

@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; connect-src *; img-src 'self' blob: data:; media-src blob: data:;">
 
     <title>e2hat - Simple end-to-end encrypted chat</title>
     <meta name="description" content="e2hat is a simple, open-source, end-to-end encrypted messaging app built on elliptic curve cryptography. No accounts, no tracking, just math-backed privacy.">
@@ -195,9 +196,29 @@
                     <div class="messages" ref="messagesEl">
                         <div v-for="(msg, i) in activeMessages" :key="i"
                              class="message" :class="{ sent: msg.sent, received: !msg.sent }">
-                            {{ msg.text }}
+                            <img v-if="isImageMsg(msg.text)" :src="mediaSrc(msg.text)" class="chat-media" />
+                            <template v-else-if="isAudioMsg(msg.text)">
+                                <audio v-if="msg._blobUrl && msg._blobUrl !== 'error'" :src="msg._blobUrl" controls class="chat-media-audio"></audio>
+                                <div v-else-if="msg._blobUrl === 'error'" class="media-error">Audio corrupted</div>
+                                <div v-else class="media-placeholder" @click="loadMedia(msg)">
+                                    <span class="media-placeholder-icon">&#127911;</span>
+                                    <span class="media-placeholder-text">Tap to load audio</span>
+                                </div>
+                            </template>
+                            <template v-else-if="isVideoMsg(msg.text)">
+                                <video v-if="msg._blobUrl && msg._blobUrl !== 'error'" :src="msg._blobUrl" controls class="chat-media-video"></video>
+                                <div v-else-if="msg._blobUrl === 'error'" class="media-error">Video corrupted</div>
+                                <div v-else class="media-placeholder" @click="loadMedia(msg)">
+                                    <span class="media-placeholder-icon">&#9654;</span>
+                                    <span class="media-placeholder-text">Tap to load video</span>
+                                </div>
+                            </template>
+                            <span v-else>{{ msg.text }}</span>
                             <div class="time">
                                 {{ msg.time }}
+                                <span v-if="msg.sent && msg._multipartTotal && msg.status === 'sending'" class="sending-progress">
+                                    Sending {{ msg._multipartDone || 0 }}/{{ msg._multipartTotal }}...
+                                </span>
                                 <span v-if="msg.sent" class="msg-status" :class="msg.status || 'sending'">
                                     <span v-if="msg.status === 'sending'" class="status-icon">&#8987;</span>
                                     <span v-else-if="msg.status === 'sent'" class="status-icon">&#10003;</span>
@@ -216,6 +237,10 @@
                     </div>
 
                     <div class="input-area">
+                        <input type="file" ref="fileInput" accept="image/*,audio/*,video/*" @change="handleFileSelect" style="display:none" />
+                        <button class="attach-btn" @click="triggerFileInput" title="Attach media">&#128206;</button>
+                        <button class="record-btn" :class="{ recording: isRecording }" @click="toggleRecording"
+                                :title="isRecording ? 'Stop recording' : 'Record voice'">&#127908;</button>
                         <input v-model="messageInput"
                                :maxlength="maxMessageLength"
                                placeholder="Type a message..."
