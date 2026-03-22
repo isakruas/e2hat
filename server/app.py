@@ -373,7 +373,7 @@ async def _purge_stale_sessions(app):
     """Periodically purge stale MO sessions and expired rate limit entries."""
     while True:
         await asyncio.sleep(30)
-        purged = app["sessions"].purge_stale(max_age=30)
+        purged = app["sessions"].purge_stale(max_age=120)
         if purged:
             log.info("Purged %d stale session(s)", purged)
         # Purge expired rate limit entries
