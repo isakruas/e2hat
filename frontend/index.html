@@ -217,6 +217,7 @@
 
                     <div class="input-area">
                         <input v-model="messageInput"
+                               :maxlength="maxMessageLength"
                                placeholder="Type a message..."
                                @keyup.enter="sendMessage" />
                         <button @click="sendMessage" :disabled="!messageInput.trim()">Send</button>

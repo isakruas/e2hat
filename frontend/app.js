@@ -257,6 +257,7 @@ createApp({
         const sentMessageMap = reactive({});
         const retryQueues = {};
         const seenSignatures = new Set(); // Anti-replay: track received signature fingerprints
+        const pendingMultiparts = {};  // senderHex:groupId -> { total, parts: {idx: text}, ... }
 
         const koblitz = new Koblitz(CURVE_NAME);
         const messagesEl = ref(null);
@@ -892,6 +893,38 @@ createApp({
             srv.ws.send(P.packMoRecvStep2(sessionId, c2X, c2Parity));
         }
 
+        /** Assemble multipart message and push to chat. */
+        function flushMultipart(key, partial) {
+            const mp = pendingMultiparts[key];
+            if (!mp) return;
+            if (mp.timer) clearTimeout(mp.timer);
+
+            let fullText = '';
+            for (let i = 0; i < mp.total; i++) {
+                fullText += (mp.parts[i] !== undefined) ? mp.parts[i] : '';
+            }
+
+            ensureContact(mp.senderHex);
+            if (!messages[mp.senderHex]) messages[mp.senderHex] = [];
+            messages[mp.senderHex].push({
+                text: fullText, sent: false, time: mp.time, ts: mp.ts,
+                verified: mp.verified, nonce: true,
+            });
+            saveMessages(mp.senderHex);
+
+            const viewing = activeContact.value && activeContact.value.keyHex === mp.senderHex && view.value === 'chat';
+            if (!viewing) unreadMessages[mp.senderHex] = (unreadMessages[mp.senderHex] || 0) + 1;
+
+            const c = contacts.find(c => c.keyHex === mp.senderHex);
+            const senderName = c ? c.nickname : mp.senderHex.substring(0, 16) + '...';
+            const received = Object.keys(mp.parts).length;
+            log(`Multipart assembled from ${senderName} (${received}/${mp.total} parts${partial ? ', partial' : ''}): "${fullText.substring(0, 50)}${fullText.length > 50 ? '...' : ''}"`);
+            notifyNewMessage(senderName, fullText);
+            scrollMessages();
+
+            delete pendingMultiparts[key];
+        }
+
         /** MO recv step 3: strip MO -> E, then DH decrypt -> M, Koblitz decode -> text. */
         async function handleMoRecvStep3(srvIdx, payload) {
             const srv = servers[srvIdx];
@@ -955,6 +988,42 @@ createApp({
             const text = paddedText.length > NONCE_LEN ? paddedText.substring(NONCE_LEN) : paddedText;
             log(`[${srv.name}] Koblitz decode: stripped nonce → "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}" (j=${session.j})`);
 
+            // Check for multipart header: \x01 + 2-char groupId + 1-char partIdx(base36) + 1-char total(base36)
+            if (text.length >= MULTIPART_HEADER_LEN && text.charAt(0) === MULTIPART_MARKER) {
+                const partIdx = parseInt(text.charAt(3), 36);
+                const total = parseInt(text.charAt(4), 36);
+                if (!isNaN(partIdx) && !isNaN(total) && total > 1 && partIdx < total) {
+                    const groupId = text.substring(1, 3);
+                    const content = text.substring(MULTIPART_HEADER_LEN);
+                    const key = session.senderHex + ':' + groupId;
+
+                    if (!pendingMultiparts[key]) {
+                        pendingMultiparts[key] = {
+                            total, parts: {}, verified: true,
+                            senderHex: session.senderHex,
+                            time: new Date().toLocaleTimeString(), ts: Date.now(),
+                        };
+                    }
+                    const mp = pendingMultiparts[key];
+                    mp.parts[partIdx] = content;
+                    if (!verified) mp.verified = false;
+
+                    // Reset timeout for incomplete multiparts
+                    if (mp.timer) clearTimeout(mp.timer);
+                    mp.timer = setTimeout(() => flushMultipart(key, true), 30000);
+
+                    log(`[${srv.name}] Multipart chunk ${partIdx + 1}/${total} (group: ${groupId}) from ${session.senderHex.substring(0, 16)}...`);
+
+                    // All parts received — assemble
+                    if (Object.keys(mp.parts).length >= mp.total) {
+                        flushMultipart(key, false);
+                    }
+
+                    delete pendingRecvSessions[sessionId];
+                    return;
+                }
+            }
+
             ensureContact(session.senderHex);
 
             if (!messages[session.senderHex]) messages[session.senderHex] = [];
@@ -995,10 +1064,19 @@ createApp({
             const msgList = messages[info.destHex];
             const c = contacts.find(c => c.keyHex === info.destHex);
             const dest = c ? c.nickname : info.destHex.substring(0, 16) + '...';
-            if (msgList && msgList[info.msgIndex]) {
-                msgList[info.msgIndex].status = newStatus;
+            const msg = msgList && msgList[info.msgIndex];
+            if (msg) {
+                if (msg._multipartTotal) {
+                    msg._multipartDone = (msg._multipartDone || 0) + 1;
+                    if (msg._multipartDone >= msg._multipartTotal) {
+                        msg.status = newStatus;
+                        msg._multipartDone = 0; // reset for next status level
+                    }
+                } else {
+                    msg.status = newStatus;
+                }
                 saveMessages(info.destHex);
-                log(`Message to ${dest} → ${newStatus}`);
+                log(`Message to ${dest} → ${newStatus}${msg._multipartTotal ? ` (${msg._multipartDone}/${msg._multipartTotal})` : ''}`);
             }
             delete sentMessageMap[sid];
             cleanSentMessageMap();
@@ -1007,14 +1085,25 @@ createApp({
         // === SEND MESSAGE ===
         const NONCE_LEN = 4;
         const KOBLITZ_MAX = 51; // secp521r1 Koblitz limit (55) minus nonce prefix
+        const MULTIPART_MARKER = '\x01';
+        const MULTIPART_HEADER_LEN = 5; // \x01 + 2-char groupId + 1-char partIdx(base36) + 1-char total(base36)
+        const MULTIPART_KOBLITZ_MAX = KOBLITZ_MAX - MULTIPART_HEADER_LEN; // 46
+        const MAX_MESSAGE_LENGTH = 36 * MULTIPART_KOBLITZ_MAX; // max parts(base36) * chars per part
+        const maxMessageLength = ref(MAX_MESSAGE_LENGTH);
 
-        /** Split text into chunks <= KOBLITZ_MAX, breaking at spaces when possible. */
-        function splitText(text) {
+        function generateGroupId() {
+            const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+            return chars[Math.floor(Math.random() * 36)] + chars[Math.floor(Math.random() * 36)];
+        }
+
+        /** Split text into chunks <= max, breaking at spaces when possible. */
+        function splitText(text, max) {
+            max = max || KOBLITZ_MAX;
             const parts = [];
             let remaining = text;
-            while (remaining.length > KOBLITZ_MAX) {
-                let cut = remaining.lastIndexOf(' ', KOBLITZ_MAX);
-                if (cut <= 0) cut = KOBLITZ_MAX; // no space found, hard cut
+            while (remaining.length > max) {
+                let cut = remaining.lastIndexOf(' ', max);
+                if (cut <= 0) cut = max; // no space found, hard cut
                 parts.push(remaining.substring(0, cut));
                 remaining = remaining.substring(cut).trimStart();
             }
@@ -1022,7 +1111,7 @@ createApp({
             return parts;
         }
 
-        async function sendChunk(chunkText, destHex, srvIdx) {
+        async function sendChunk(chunkText, destHex, srvIdx, multipartMsgIndex) {
             const srv = servers[srvIdx];
             // Prepend random nonce to make encryption non-deterministic
             const nonce = generateNonce();
@@ -1049,10 +1138,15 @@ createApp({
             const [c1X, c1Parity] = c1Point.compress();
             const [eX, eParity] = ePoint.compress();
 
-            if (!messages[destHex]) messages[destHex] = [];
-            const msgIndex = messages[destHex].length;
-            messages[destHex].push({ text: chunkText, sent: true, time: new Date().toLocaleTimeString(), ts: timestampMs, status: 'sending', e_x: eX.toString(16), e_parity: Number(eParity), j, nonce: true });
-            saveMessages(destHex);
+            let msgIndex;
+            if (multipartMsgIndex !== undefined) {
+                msgIndex = multipartMsgIndex;
+            } else {
+                if (!messages[destHex]) messages[destHex] = [];
+                msgIndex = messages[destHex].length;
+                messages[destHex].push({ text: chunkText, sent: true, time: new Date().toLocaleTimeString(), ts: timestampMs, status: 'sending', e_x: eX.toString(16), e_parity: Number(eParity), j, nonce: true });
+                saveMessages(destHex);
+            }
 
             if (!pendingSendQueues[srvIdx]) pendingSendQueues[srvIdx] = [];
             pendingSendQueues[srvIdx].push({ moInstance: srv.mo, destHex, j, msgIndex, srvIdx });
@@ -1072,9 +1166,25 @@ createApp({
             if (text.length <= KOBLITZ_MAX) {
                 sendChunk(text, destHex, srvIdx);
             } else {
-                const parts = splitText(text);
-                log(`Message too long (${text.length} chars), splitting into ${parts.length} parts`);
-                for (const part of parts) sendChunk(part, destHex, srvIdx);
+                const groupId = generateGroupId();
+                const parts = splitText(text, MULTIPART_KOBLITZ_MAX);
+                const total = parts.length;
+                log(`Message split into ${total} parts (group: ${groupId})`);
+
+                // Push ONE message with full text for display
+                if (!messages[destHex]) messages[destHex] = [];
+                const msgIndex = messages[destHex].length;
+                messages[destHex].push({
+                    text, sent: true, time: new Date().toLocaleTimeString(),
+                    ts: Date.now(), status: 'sending',
+                    _multipartTotal: total, _multipartDone: 0,
+                });
+                saveMessages(destHex);
+
+                for (let i = 0; i < total; i++) {
+                    const header = MULTIPART_MARKER + groupId + i.toString(36) + total.toString(36);
+                    sendChunk(header + parts[i], destHex, srvIdx, msgIndex);
+                }
             }
 
             messageInput.value = '';
@@ -1184,7 +1294,7 @@ createApp({
             screen, view, showServers, nickname, status, logs,
             compressedPubKeyDisplay, copied,
             servers, contacts, activeContact, activeMessages,
-            messageInput, messagesEl, logEl,
+            messageInput, maxMessageLength, messagesEl, logEl,
             newContactNick, newContactKey, editingContact,
             newServerName, newServerUrl, showAddContact, showAddServer,
             logHeight,
