@@ -23,6 +23,7 @@ State (stored in app dict):
 
 import logging
 import random
+import time
 
 from aiohttp import web
 from ecutils import MasseyOmura, Point, get_curve
@@ -35,6 +36,7 @@ log = logging.getLogger(__name__)
 
 CURVE_NAME = "secp521r1"
 curve = get_curve(CURVE_NAME)
+QUEUE_TTL = 86400  # 24 hours in seconds
 
 
 def _pubkey_hex(x, parity):
@@ -109,8 +111,7 @@ async def _handle_hello(app, ws, payload):
     app["clients"][pubkey_hex] = {"ws": ws, "mo": mo}
     log.info("Client connected: %s...", pubkey_hex[:20])
 
-    # Send WELCOME with server's MO public key for this client
-    # MO public key = mo_key * G
+    # Send WELCOME with server's MO public key
     from ecutils import DiffieHellman
     dh_temp = DiffieHellman(private_key=mo_key, curve_name=CURVE_NAME)
     server_mo_pub = dh_temp.public_key
@@ -203,7 +204,7 @@ async def _handle_mo_send_step3(app, ws, payload):
     await _initiate_delivery(app, sender_hex, dest_hex, j, e_point, session_id)
 
 
-async def _initiate_delivery(app, sender_hex, dest_hex, j, e_point, send_sid=None):
+async def _initiate_delivery(app, sender_hex, dest_hex, j, e_point, send_sid=None, queued_at=None):
     """Start MO 3-pass delivery to receiver."""
     dest_info = app["clients"].get(dest_hex)
 
@@ -217,6 +218,7 @@ async def _initiate_delivery(app, sender_hex, dest_hex, j, e_point, send_sid=Non
             "e_x": e_x,
             "e_parity": e_parity,
             "send_sid": send_sid,
+            "queued_at": queued_at or time.time(),
         })
         log.info("Queued message for offline user %s...", dest_hex[:20])
         # Notify sender: queued
@@ -234,6 +236,7 @@ async def _initiate_delivery(app, sender_hex, dest_hex, j, e_point, send_sid=Non
     c1_x, c1_parity = c1_point.compress()
 
     # Create delivery session
+    e_x, e_parity = e_point.compress()
     sessions = app["sessions"]
     sid = sessions.create_session(
         sender=sender_hex,
@@ -241,6 +244,9 @@ async def _initiate_delivery(app, sender_hex, dest_hex, j, e_point, send_sid=Non
         j=j,
         server_mo_receiver=server_mo,
         send_sid=send_sid,
+        e_x=e_x,
+        e_parity=e_parity,
+        queued_at=queued_at or time.time(),
     )
     sessions.set_state(sid, WAIT_RECV_STEP2)
 
@@ -294,19 +300,39 @@ async def _handle_mo_recv_step2(app, ws, payload):
 
 async def _deliver_queued(app, pubkey_hex):
     """Deliver queued messages to a client that just connected."""
+    now = time.time()
     queue = app["queues"].pop(pubkey_hex, [])
     for item in queue:
+        queued_at = item.get("queued_at", now)
+        if now - queued_at > QUEUE_TTL:
+            log.info("Discarded expired message for %s... (queued %.0fh ago)",
+                     pubkey_hex[:20], (now - queued_at) / 3600)
+            continue
         e_point = Point.decompress(item["e_x"], item["e_parity"], curve)
         await _initiate_delivery(
             app, item["sender"], pubkey_hex, item["j"], e_point,
-            item.get("send_sid"),
+            item.get("send_sid"), queued_at,
         )
 
 
 def _handle_disconnect(app, pubkey_hex):
     """Clean up when a client disconnects."""
     app["clients"].pop(pubkey_hex, None)
-    app["sessions"].cleanup_for_client(pubkey_hex)
+    requeue_items = app["sessions"].cleanup_for_client(pubkey_hex)
+
+    # Re-enqueue messages from interrupted deliveries
+    for item in requeue_items:
+        dest_hex = item["dest"]
+        queue = app["queues"].setdefault(dest_hex, [])
+        queue.append({
+            "sender": item["sender"],
+            "j": item["j"],
+            "e_x": item["e_x"],
+            "e_parity": item["e_parity"],
+            "send_sid": item.get("send_sid"),
+            "queued_at": item.get("queued_at", time.time()),
+        })
+        log.info("Re-queued message for %s... (receiver disconnected mid-delivery)", dest_hex[:20])
 
     x, parity = _parse_pubkey_hex(pubkey_hex)
     # Notify others (best-effort, ignore failures on closing sockets)

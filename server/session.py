@@ -22,9 +22,7 @@ import threading
 
 # Session states
 WAIT_STEP3 = "WAIT_STEP3"            # Sender session: waiting for client's step 3
-DELIVERING = "DELIVERING"            # Transitional: sender done, starting receiver delivery
 WAIT_RECV_STEP2 = "WAIT_RECV_STEP2"  # Receiver session: waiting for receiver's step 2
-COMPLETE = "COMPLETE"                # Terminal state (session removed immediately after)
 
 
 class SessionManager:
@@ -56,7 +54,6 @@ class SessionManager:
             self._sessions[sid] = {
                 "id": sid,
                 "state": WAIT_STEP3,
-                "points": {},
                 "metadata": metadata,
             }
             return sid
@@ -71,22 +68,38 @@ class SessionManager:
         if session:
             session["state"] = state
 
-    def store_point(self, session_id, key, value):
-        """Store an intermediate curve point in the session."""
-        session = self._sessions.get(session_id)
-        if session:
-            session["points"][key] = value
-
     def remove(self, session_id):
         """Remove a completed or expired session."""
         self._sessions.pop(session_id, None)
 
     def cleanup_for_client(self, pubkey_hex):
-        """Remove all sessions involving a disconnected client."""
+        """Remove all sessions involving a disconnected client.
+
+        Returns a list of dicts for WAIT_RECV_STEP2 sessions where the
+        *receiver* (dest) disconnected and the message has stored e_x/e_parity.
+        These can be re-enqueued for later delivery.
+        """
         to_remove = []
+        requeue = []
         for sid, sess in self._sessions.items():
             meta = sess["metadata"]
             if meta.get("sender") == pubkey_hex or meta.get("dest") == pubkey_hex:
                 to_remove.append(sid)
+                # Receiver disconnected mid-delivery
+                if (
+                    sess["state"] == WAIT_RECV_STEP2
+                    and meta.get("dest") == pubkey_hex
+                    and "e_x" in meta
+                ):
+                    requeue.append({
+                        "sender": meta["sender"],
+                        "dest": meta["dest"],
+                        "j": meta["j"],
+                        "e_x": meta["e_x"],
+                        "e_parity": meta["e_parity"],
+                        "send_sid": meta.get("send_sid"),
+                        "queued_at": meta.get("queued_at"),
+                    })
         for sid in to_remove:
             self._sessions.pop(sid, None)
+        return requeue

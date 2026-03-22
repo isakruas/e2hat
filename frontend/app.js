@@ -42,7 +42,7 @@ function gcd(a, b) {
     return a;
 }
 
-/** Generate a random key coprime with curve order n (required for Massey-Omura). */
+/** Random key coprime with n for Massey-Omura. */
 function randomMoKey() {
     while (true) {
         const k = randomPrivateKey();
@@ -50,18 +50,18 @@ function randomMoKey() {
     }
 }
 
-/** Serialize a compressed point as "hex_x:parity" string (used as identifier). */
+/** Compressed point -> "hex_x:parity" identifier. */
 function pointToHex(x, parity) {
     return x.toString(16).padStart(132, '0') + ':' + parity.toString();
 }
 
-/** Deserialize "hex_x:parity" string back to {x, parity} BigInts. */
+/** "hex_x:parity" -> {x, parity} BigInts. */
 function hexToPoint(hex) {
     const parts = hex.split(':');
     return { x: BigInt('0x' + parts[0]), parity: BigInt(parts[1]) };
 }
 
-/** Extended Euclidean algorithm for modular inverse (needed for DH decryption). */
+/** Modular inverse via extended Euclidean algorithm. */
 function modInverse(a, m) {
     a = ((a % m) + m) % m;
     let [old_r, r] = [a, m];
@@ -74,51 +74,105 @@ function modInverse(a, m) {
     return ((old_s % m) + m) % m;
 }
 
-// --- Password-based key management ---
-// Keys are encrypted using Koblitz: encode the password as a curve point,
-// use its X coordinate as a derived key, then add/subtract mod n to encrypt/decrypt.
+// --- Key derivation and encryption ---
 
-/** Derive a deterministic key from a password using Koblitz encoding. */
-function deriveKeyFromPassword(password) {
+/** SHA-256(password) -> Koblitz.encode(hash_hex) -> point.x */
+async function deriveKeyFromPassword(password) {
+    const data = new TextEncoder().encode(password);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashHex = Array.from(new Uint8Array(hashBuffer), b => b.toString(16).padStart(2, '0')).join('');
     const kob = new Koblitz(CURVE_NAME);
-    const [point] = kob.encode(password);
+    const [point] = kob.encode(hashHex);
     return point.x;
 }
 
-/** Encrypt a private key: (key + derived) mod n. */
+/** SHA-256 fingerprint of derived key for password verification. */
+async function hashCheck(dk) {
+    const data = new TextEncoder().encode(dk.toString(16));
+    const buf = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** (key + derived) mod n */
 function encryptKey(privateKey, derivedKey) {
     return ((privateKey + derivedKey) % curve.n).toString(16);
 }
 
-/** Decrypt a private key: (encrypted - derived) mod n. */
+/** (encrypted - derived) mod n */
 function decryptKey(encryptedHex, derivedKey) {
     const encrypted = BigInt('0x' + encryptedHex);
     return ((encrypted - derivedKey) % curve.n + curve.n) % curve.n;
 }
 
-// --- localStorage message encryption ---
-// Messages are XOR-encrypted with the derived key bytes before storing.
-// This prevents reading message history without the password.
+// --- IndexedDB storage ---
 
-function xorEncrypt(text, derivedKey) {
-    const keyBytes = [];
-    let k = derivedKey;
-    for (let i = 0; i < 66; i++) { keyBytes.push(Number(k & 0xFFn)); k >>= 8n; }
-    const textBytes = new TextEncoder().encode(text);
-    const out = new Uint8Array(textBytes.length);
-    for (let i = 0; i < textBytes.length; i++) out[i] = textBytes[i] ^ keyBytes[i % keyBytes.length];
-    return Array.from(out, b => b.toString(16).padStart(2, '0')).join('');
+const DB_NAME = 'e2hat';
+const DB_VERSION = 1;
+let _db = null;
+
+function openDB() {
+    if (_db) return Promise.resolve(_db);
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            for (const name of ['config', 'keys', 'messages']) {
+                if (!db.objectStoreNames.contains(name)) db.createObjectStore(name);
+            }
+        };
+        req.onsuccess = () => { _db = req.result; resolve(_db); };
+        req.onerror = () => reject(req.error);
+    });
 }
 
-function xorDecrypt(hex, derivedKey) {
-    const keyBytes = [];
-    let k = derivedKey;
-    for (let i = 0; i < 66; i++) { keyBytes.push(Number(k & 0xFFn)); k >>= 8n; }
-    const encBytes = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < encBytes.length; i++) encBytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-    const out = new Uint8Array(encBytes.length);
-    for (let i = 0; i < encBytes.length; i++) out[i] = encBytes[i] ^ keyBytes[i % keyBytes.length];
-    return new TextDecoder().decode(out);
+async function idbGet(store, key) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readonly');
+        const req = tx.objectStore(store).get(key);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function idbPut(store, key, value) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readwrite');
+        const req = tx.objectStore(store).put(value, key);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function idbDel(store, key) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readwrite');
+        const req = tx.objectStore(store).delete(key);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function idbGetAllKeys(store) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readonly');
+        const req = tx.objectStore(store).getAllKeys();
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function idbClear(store) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readwrite');
+        const req = tx.objectStore(store).clear();
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+    });
 }
 
 createApp({
@@ -126,36 +180,25 @@ createApp({
         const screen = ref('setup');
         const view = ref('contacts');
         const showServers = ref(true);
-        const nickname = ref(localStorage.getItem('e2hat_nickname') || '');
+        const nickname = ref('');
         const status = ref('');
         const logs = ref([]);
 
         const dhPrivateKey = ref(null);
         const dhPublicKey = ref(null);
-        const moInstance = ref(null);
         const moPrivateKey = ref(null);
         const myPubKeyHex = ref('');
-        let derivedKeyCache = null;
 
-        // --- Multi-server state ---
-        // Each server entry holds its own WebSocket, MO instance, and peer tracking.
-        // Servers are independent relays — a message is routed through whichever
-        // server the recipient is connected to.
         const DEFAULT_SERVERS = [
             { name: 'Local', url: 'wss://relay.e2hat.com/ws' },
         ];
-        const savedServers = JSON.parse(localStorage.getItem('e2hat_servers') || 'null');
-        const initialServers = savedServers !== null ? savedServers : DEFAULT_SERVERS;
-        const servers = reactive(initialServers.map(s => ({
-            name: s.name,
-            url: s.url,
-            state: 'disconnected',
-            ws: null,
-            mo: null,
-            onlinePeers: new Set(),
-        })));
+        const DEFAULT_CONTACT = {
+            nickname: 'e2hat team',
+            keyHex: '00f33fb6a24290ee1d534ff3fd0976786bba24b18880220dce644a21fdc030e3c367fcaf37031f2f2afe68df77f0c4a7c708d7963c78c993683a87f0fbb401be222d:1'
+        };
 
-        const contacts = reactive(JSON.parse(localStorage.getItem('e2hat_contacts') || '[]'));
+        const servers = reactive([]);
+        const contacts = reactive([]);
         const activeContact = ref(null);
         const messages = reactive({});
         const messageInput = ref('');
@@ -169,15 +212,11 @@ createApp({
         const showAddContact = ref(false);
         const showAddServer = ref(false);
 
-        // Pending MO 3-pass sessions, keyed by session ID.
-        // Send sessions track outgoing messages mid-3-pass (we need the MO instance to decrypt step 2).
-        // Recv sessions track incoming messages mid-3-pass (we need the MO instance to decrypt step 3).
-        // A temporary key '_next_send_<srvIdx>' holds the session before the server assigns an ID.
         const pendingSendSessions = reactive({});
+        const pendingSendQueues = {};  // srvIdx -> FIFO of sessions awaiting server-assigned ID
         const pendingRecvSessions = reactive({});
-        // Maps MO session IDs to {destHex, msgIndex} so we can update delivery status
-        // (sending -> sent -> delivered/queued) on the correct message in the UI.
         const sentMessageMap = reactive({});
+        const retryQueues = {};
 
         const koblitz = new Koblitz(CURVE_NAME);
         const messagesEl = ref(null);
@@ -186,11 +225,43 @@ createApp({
         const copied = ref(false);
         let copiedTimeout = null;
 
-        const hasSavedKeys = ref(!!localStorage.getItem('e2hat_encrypted_keys'));
+        const hasSavedKeys = ref(false);
         const restoredKeys = ref(false);
         const restorePassword = ref('');
         const savePassword = ref('');
         const keysSaved = ref(false);
+
+        // Load persisted state from IndexedDB
+        (async () => {
+            try {
+                const [savedNick, savedServers, savedContacts, savedKeys] = await Promise.all([
+                    idbGet('config', 'nickname'),
+                    idbGet('config', 'servers'),
+                    idbGet('config', 'contacts'),
+                    idbGet('keys', 'encrypted'),
+                ]);
+                if (savedNick) nickname.value = savedNick;
+                hasSavedKeys.value = !!savedKeys;
+                const srvList = savedServers || DEFAULT_SERVERS;
+                srvList.forEach(s => servers.push({
+                    name: s.name, url: s.url, state: 'disconnected',
+                    ws: null, mo: null, onlinePeers: new Set(),
+                }));
+                const contactList = savedContacts || [];
+                if (!contactList.find(c => c.keyHex === DEFAULT_CONTACT.keyHex)) {
+                    contactList.unshift(DEFAULT_CONTACT);
+                }
+                contactList.forEach(c => contacts.push(c));
+            } catch (e) {
+                console.error('Failed to load from IndexedDB:', e);
+                // Fallback: add defaults
+                DEFAULT_SERVERS.forEach(s => servers.push({
+                    name: s.name, url: s.url, state: 'disconnected',
+                    ws: null, mo: null, onlinePeers: new Set(),
+                }));
+                contacts.push(DEFAULT_CONTACT);
+            }
+        })();
 
         // --- Computed ---
         const activeMessages = computed(() => {
@@ -277,29 +348,68 @@ createApp({
             copiedTimeout = setTimeout(() => { copied.value = false; }, 1500);
         }
 
-        // --- Encrypted persistence ---
-        function saveMessages() {
-            if (!derivedKeyCache) return;
-            const plain = JSON.stringify(messages);
-            localStorage.setItem('e2hat_encrypted_messages', xorEncrypt(plain, derivedKeyCache));
+        // --- Persistence (IndexedDB) ---
+
+        function saveMessages(contactHex) {
+            if (contactHex) {
+                const list = (messages[contactHex] || []).map(({ text, ...rest }) => rest);
+                idbPut('messages', contactHex, list);
+            } else {
+                for (const key of Object.keys(messages)) {
+                    const list = messages[key].map(({ text, ...rest }) => rest);
+                    idbPut('messages', key, list);
+                }
+            }
         }
 
-        function loadMessages(dk) {
-            const enc = localStorage.getItem('e2hat_encrypted_messages');
-            if (!enc) return;
-            try {
-                const parsed = JSON.parse(xorDecrypt(enc, dk));
-                for (const key of Object.keys(parsed)) messages[key] = parsed[key];
-                log(`Messages restored (${Object.keys(parsed).length} conversations)`);
-            } catch { log('Could not restore messages'); }
+        const MSG_TTL = 365 * 24 * 60 * 60 * 1000; // 1 year in ms
+
+        async function loadMessages() {
+            const keys = await idbGetAllKeys('messages');
+            if (!keys.length) return;
+            const now = Date.now();
+            const invCache = {};
+            let totalLoaded = 0;
+            let totalExpired = 0;
+            for (const contactHex of keys) {
+                const msgList = await idbGet('messages', contactHex);
+                if (!msgList) continue;
+                const fresh = msgList.filter(m => {
+                    if (m.ts && now - m.ts > MSG_TTL) { totalExpired++; return false; }
+                    return true;
+                });
+                if (fresh.length < msgList.length) {
+                    if (fresh.length === 0) { idbDel('messages', contactHex); continue; }
+                    idbPut('messages', contactHex, fresh);
+                }
+                messages[contactHex] = fresh.map(m => {
+                    if (!m.e_x) return { ...m, text: '[unreadable]' };
+                    try {
+                        if (!invCache[contactHex]) {
+                            const pt = hexToPoint(contactHex);
+                            const pubKey = Point.decompress(pt.x, pt.parity, curve);
+                            const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
+                            const shared = dh.computeSharedSecret(pubKey);
+                            invCache[contactHex] = modInverse(shared.x, curve.n);
+                        }
+                        const ePoint = Point.decompress(BigInt('0x' + m.e_x), BigInt(m.e_parity), curve);
+                        const mPoint = ePoint.mul(invCache[contactHex]);
+                        return { ...m, text: koblitz.decode(mPoint, m.j) };
+                    } catch {
+                        return { ...m, text: '[decrypt error]' };
+                    }
+                });
+                totalLoaded += messages[contactHex].length;
+            }
+            log(`Messages restored: ${totalLoaded} messages across ${keys.length} conversations${totalExpired ? ` (${totalExpired} expired, removed)` : ''}`);
         }
 
         function saveServers() {
-            localStorage.setItem('e2hat_servers', JSON.stringify(servers.map(s => ({ name: s.name, url: s.url }))));
+            idbPut('config', 'servers', servers.map(s => ({ name: s.name, url: s.url })));
         }
 
         function saveContacts() {
-            localStorage.setItem('e2hat_contacts', JSON.stringify(contacts));
+            idbPut('config', 'contacts', contacts.map(c => ({ keyHex: c.keyHex, nickname: c.nickname })));
         }
 
         // --- Key management ---
@@ -311,28 +421,27 @@ createApp({
                 dhPublicKey.value = dh.publicKey;
                 const moKey = randomMoKey();
                 moPrivateKey.value = moKey;
-                moInstance.value = new MasseyOmura(moKey, CURVE_NAME);
+
                 const [x, parity] = dhPublicKey.value.compress();
                 myPubKeyHex.value = pointToHex(x, parity);
                 status.value = 'Keys generated!';
-                log('DH and MO key pairs generated');
+                log(`DH and MO key pairs generated (pub: ${myPubKeyHex.value.substring(0, 16)}...)`);
             }, 50);
         }
 
         function saveKeys() {
             if (!savePassword.value.trim() || !dhPrivateKey.value || !moPrivateKey.value) return;
             status.value = 'Encrypting keys...';
-            setTimeout(() => {
+            setTimeout(async () => {
                 try {
-                    const dk = deriveKeyFromPassword(savePassword.value);
-                    derivedKeyCache = dk;
-                    const checkHash = (dk % 0xFFFFFFFFn).toString(16);
-                    localStorage.setItem('e2hat_encrypted_keys', JSON.stringify({
+                    const dk = await deriveKeyFromPassword(savePassword.value);
+                    const check = await hashCheck(dk);
+                    await idbPut('keys', 'encrypted', {
                         dh: encryptKey(dhPrivateKey.value, dk),
                         mo: encryptKey(moPrivateKey.value, dk),
-                        check: checkHash,
-                    }));
-                    localStorage.setItem('e2hat_nickname', nickname.value);
+                        check,
+                    });
+                    await idbPut('config', 'nickname', nickname.value);
                     keysSaved.value = true;
                     hasSavedKeys.value = true;
                     status.value = 'Keys saved encrypted';
@@ -344,13 +453,13 @@ createApp({
         function restoreKeys() {
             if (!restorePassword.value.trim()) return;
             status.value = 'Decrypting keys...';
-            setTimeout(() => {
+            setTimeout(async () => {
                 try {
-                    const data = JSON.parse(localStorage.getItem('e2hat_encrypted_keys'));
-                    const dk = deriveKeyFromPassword(restorePassword.value);
-                    // Verify password
-                    const checkHash = (dk % 0xFFFFFFFFn).toString(16);
-                    if (data.check && data.check !== checkHash) {
+                    const data = await idbGet('keys', 'encrypted');
+                    if (!data) { status.value = 'No saved keys'; return; }
+                    const dk = await deriveKeyFromPassword(restorePassword.value);
+                    const check = await hashCheck(dk);
+                    if (data.check && data.check !== check) {
                         status.value = 'Wrong password';
                         return;
                     }
@@ -360,12 +469,12 @@ createApp({
                     dhPrivateKey.value = dhKey;
                     dhPublicKey.value = dh.publicKey;
                     moPrivateKey.value = moKey;
-                    moInstance.value = new MasseyOmura(moKey, CURVE_NAME);
+    
                     const [x, parity] = dhPublicKey.value.compress();
                     myPubKeyHex.value = pointToHex(x, parity);
-                    derivedKeyCache = dk;
-                    loadMessages(dk);
-                    nickname.value = localStorage.getItem('e2hat_nickname') || '';
+                    await loadMessages();
+                    const savedNick = await idbGet('config', 'nickname');
+                    if (savedNick) nickname.value = savedNick;
                     restoredKeys.value = true;
                     keysSaved.value = true;
                     status.value = 'Keys restored!';
@@ -376,9 +485,9 @@ createApp({
             }, 50);
         }
 
-        function clearSavedKeys() {
-            localStorage.removeItem('e2hat_encrypted_keys');
-            localStorage.removeItem('e2hat_encrypted_messages');
+        async function clearSavedKeys() {
+            await idbDel('keys', 'encrypted');
+            await idbClear('messages');
             hasSavedKeys.value = false;
             restoredKeys.value = false;
             restorePassword.value = '';
@@ -421,7 +530,7 @@ createApp({
                     dhPrivateKey.value = dhKey;
                     dhPublicKey.value = dh.publicKey;
                     moPrivateKey.value = moKey;
-                    moInstance.value = new MasseyOmura(moKey, CURVE_NAME);
+    
                     const [x, parity] = dhPublicKey.value.compress();
                     myPubKeyHex.value = pointToHex(x, parity);
                     if (data.nickname) nickname.value = data.nickname;
@@ -469,10 +578,10 @@ createApp({
             }
         });
 
-        // --- Enter chat (no auto-connect, user manages servers) ---
+        // --- Enter chat ---
         function enterChat() {
             if (!nickname.value.trim() || !dhPublicKey.value) return;
-            localStorage.setItem('e2hat_nickname', nickname.value);
+            idbPut('config', 'nickname', nickname.value);
             screen.value = 'chat';
             view.value = servers.length ? 'contacts' : 'servers';
             log('Entered chat');
@@ -536,7 +645,7 @@ createApp({
 
                 ws.onopen = () => {
                     srv._retries = 0;
-                    log(`[${srv.name}] Connected`);
+                    log(`[${srv.name}] WebSocket connected to ${srv.url}`);
                     const moKey = randomMoKey();
                     srv.mo = new MasseyOmura(moKey, CURVE_NAME);
                     const [x, parity] = dhPublicKey.value.compress();
@@ -553,6 +662,7 @@ createApp({
                     srv.state = 'disconnected';
                     srv.ws = null;
                     srv.onlinePeers.clear();
+                    delete pendingSendQueues[index];
                     scheduleReconnect(index);
                 };
 
@@ -591,9 +701,25 @@ createApp({
 
             switch (msgType) {
                 case P.WELCOME: {
-                    P.unpackWelcome(payload); // parse for logging
+                    const wInfo = P.unpackWelcome(payload);
                     srv.state = 'connected';
-                    log(`[${srv.name}] Handshake complete`);
+                    log(`[${srv.name}] Handshake complete (MO pub ${wInfo.x.toString(16).substring(0, 12)}...)`);
+                    // Retry 'sending' messages on this server
+                    const retryItems = [];
+                    for (const destHex of Object.keys(messages)) {
+                        const msgList = messages[destHex];
+                        for (let i = 0; i < msgList.length; i++) {
+                            const m = msgList[i];
+                            if (m.status === 'sending' && m.e_x) {
+                                retryItems.push({ destHex, msgIndex: i, e_x: m.e_x, e_parity: m.e_parity, j: m.j });
+                            }
+                        }
+                    }
+                    if (retryItems.length) {
+                        retryQueues[srvIdx] = retryItems;
+                        log(`[${srv.name}] Retrying ${retryItems.length} pending message(s)`);
+                        flushNextRetry(srvIdx);
+                    }
                     break;
                 }
                 case P.MO_SEND_STEP2: handleMoSendStep2(srvIdx, payload); break;
@@ -613,7 +739,7 @@ createApp({
                     const hex = pointToHex(x, parity);
                     srv.onlinePeers.add(hex);
                     const c = contacts.find(c => c.keyHex === hex);
-                    log(`[${srv.name}] ${c ? c.nickname : hex.substring(0, 16) + '...'} online`);
+                    log(`[${srv.name}] Peer online: ${c ? c.nickname : hex.substring(0, 16) + '...'} (${srv.onlinePeers.size} peers)`);
                     break;
                 }
                 case P.PEER_OFFLINE: {
@@ -621,60 +747,88 @@ createApp({
                     const hex = pointToHex(x, parity);
                     srv.onlinePeers.delete(hex);
                     const c = contacts.find(c => c.keyHex === hex);
-                    log(`[${srv.name}] ${c ? c.nickname : hex.substring(0, 16) + '...'} offline`);
+                    log(`[${srv.name}] Peer offline: ${c ? c.nickname : hex.substring(0, 16) + '...'} (${srv.onlinePeers.size} peers)`);
                     break;
                 }
             }
         }
 
-        /** MO send step 2: server returned C2 = server_mo.encrypt(C1).
-         *  We compute C3 = our_mo.decrypt(C2) and send it back.
-         *  After this, the server can decrypt C3 to obtain E. */
+        /** MO send step 2: strip our MO layer -> C3 = mo.decrypt(C2), send back. */
         function handleMoSendStep2(srvIdx, payload) {
             const srv = servers[srvIdx];
             const { sessionId, x, parity } = P.unpackMoSendStep2(payload);
 
             let session = pendingSendSessions[sessionId];
-            if (!session && pendingSendSessions['_next_send_' + srvIdx]) {
-                session = pendingSendSessions['_next_send_' + srvIdx];
-                delete pendingSendSessions['_next_send_' + srvIdx];
-                pendingSendSessions[sessionId] = session;
+            if (!session) {
+                const queue = pendingSendQueues[srvIdx];
+                if (queue && queue.length) {
+                    session = queue.shift();
+                    pendingSendSessions[sessionId] = session;
+                }
             }
             if (!session) { log(`  Session ${sessionId} not found`); return; }
 
             const c2Point = Point.decompress(x, parity, curve);
+            log(`[${srv.name}] MO received C2 from server (C2.x: ${c2Point.x.toString(16).substring(0, 16)}...)`);
             const c3Point = session.moInstance.decrypt(c2Point);
+            log(`[${srv.name}] MO decrypt: C3 = mo.decrypt(C2) (C3.x: ${c3Point.x.toString(16).substring(0, 16)}...)`);
             const [c3X, c3Parity] = c3Point.compress();
 
-            log(`[${srv.name}] >> MO_SEND_STEP3`);
+            log(`[${srv.name}] >> MO_SEND_STEP3 (sid=${sessionId})`);
             srv.ws.send(P.packMoSendStep3(sessionId, c3X, c3Parity));
 
             if (session.msgIndex !== undefined) {
-                sentMessageMap[sessionId] = { destHex: session.destHex, msgIndex: session.msgIndex };
+                sentMessageMap[sessionId] = { destHex: session.destHex, msgIndex: session.msgIndex, ts: Date.now() };
             }
+            const retrySrvIdx = session.srvIdx;
             delete pendingSendSessions[sessionId];
+            if (retrySrvIdx !== undefined) flushNextRetry(retrySrvIdx);
         }
 
-        /** MO receive step 1: server sent C1' = server_mo.encrypt(E).
-         *  We compute C2' = our_mo.encrypt(C1') and send it back. */
+        /** Drain one retry from the queue; next fires after step2 completes. */
+        function flushNextRetry(srvIdx) {
+            const queue = retryQueues[srvIdx];
+            if (!queue || !queue.length) return;
+            const srv = servers[srvIdx];
+            if (!srv || srv.state !== 'connected' || !srv.ws) return;
+
+            const item = queue.shift();
+            const destPt = hexToPoint(item.destHex);
+            const ePoint = Point.decompress(BigInt('0x' + item.e_x), BigInt(item.e_parity), curve);
+            const c1Point = srv.mo.encrypt(ePoint);
+            const [c1X, c1Parity] = c1Point.compress();
+
+            if (!pendingSendQueues[srvIdx]) pendingSendQueues[srvIdx] = [];
+            pendingSendQueues[srvIdx].push({
+                moInstance: srv.mo, destHex: item.destHex, j: item.j,
+                msgIndex: item.msgIndex, srvIdx,
+            });
+
+            const retryDest = contacts.find(c => c.keyHex === item.destHex);
+            log(`[${srv.name}] >> MO_SEND_INIT (retry to ${retryDest ? retryDest.nickname : item.destHex.substring(0, 16) + '...'}, j=${item.j})`);
+            srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, item.j, c1X, c1Parity));
+        }
+
+        /** MO recv step 1: add our MO layer -> C2' = mo.encrypt(C1'), send back. */
         function handleMoRecvInit(srvIdx, payload) {
             const srv = servers[srvIdx];
             const { sessionId, senderX, senderParity, j, c1X, c1Parity } = P.unpackMoRecvInit(payload);
             const senderHex = pointToHex(senderX, senderParity);
 
             const c1Point = Point.decompress(c1X, c1Parity, curve);
+            const recvSender = contacts.find(c => c.keyHex === senderHex);
+            log(`[${srv.name}] MO received C1' from server (C1'.x: ${c1Point.x.toString(16).substring(0, 16)}..., from ${recvSender ? recvSender.nickname : senderHex.substring(0, 16) + '...'})`);
             const c2Point = srv.mo.encrypt(c1Point);
+            log(`[${srv.name}] MO encrypt: C2' = mo.encrypt(C1') (C2'.x: ${c2Point.x.toString(16).substring(0, 16)}...)`);
             const [c2X, c2Parity] = c2Point.compress();
 
             pendingRecvSessions[sessionId] = { serverIndex: srvIdx, moInstance: srv.mo, senderHex, j };
 
-            log(`[${srv.name}] >> MO_RECV_STEP2`);
+            log(`[${srv.name}] >> MO_RECV_STEP2 (sid=${sessionId})`);
             srv.ws.send(P.packMoRecvStep2(sessionId, c2X, c2Parity));
         }
 
-        /** MO receive step 3: server sent C3' = server_mo.decrypt(C2').
-         *  We compute E = our_mo.decrypt(C3'), then DH-decrypt and Koblitz-decode
-         *  to recover the plaintext message. */
+        /** MO recv step 3: strip MO -> E, then DH decrypt -> M, Koblitz decode -> text. */
         function handleMoRecvStep3(srvIdx, payload) {
             const srv = servers[srvIdx];
             const { sessionId, x, parity } = P.unpackMoRecvStep3(payload);
@@ -684,30 +838,50 @@ createApp({
 
             const c3Point = Point.decompress(x, parity, curve);
             const ePoint = session.moInstance.decrypt(c3Point);
+            log(`[${srv.name}] MO decrypt: E = mo.decrypt(C3') (E.x: ${ePoint.x.toString(16).substring(0, 16)}...)`);
+            const [recvEX, recvEParity] = ePoint.compress();
 
             const senderPt = hexToPoint(session.senderHex);
             const senderPubKey = Point.decompress(senderPt.x, senderPt.parity, curve);
             const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
             const shared = dh.computeSharedSecret(senderPubKey);
+            log(`[${srv.name}] DH shared secret computed (x: ${shared.x.toString(16).substring(0, 16)}...)`);
             const invX = modInverse(shared.x, curve.n);
             const mPoint = ePoint.mul(invX);
+            log(`[${srv.name}] DH decrypt: M = E * shared.x⁻¹ (M.x: ${mPoint.x.toString(16).substring(0, 16)}...)`);
             const text = koblitz.decode(mPoint, session.j);
+            log(`[${srv.name}] Koblitz decode: point → "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}" (j=${session.j})`);
 
             ensureContact(session.senderHex);
 
             if (!messages[session.senderHex]) messages[session.senderHex] = [];
-            messages[session.senderHex].push({ text, sent: false, time: new Date().toLocaleTimeString() });
-            saveMessages();
+            messages[session.senderHex].push({
+                text, sent: false, time: new Date().toLocaleTimeString(), ts: Date.now(),
+                e_x: recvEX.toString(16), e_parity: Number(recvEParity), j: session.j,
+            });
+            saveMessages(session.senderHex);
 
             const viewing = activeContact.value && activeContact.value.keyHex === session.senderHex && view.value === 'chat';
             if (!viewing) unreadMessages[session.senderHex] = (unreadMessages[session.senderHex] || 0) + 1;
 
             delete pendingRecvSessions[sessionId];
             const c = contacts.find(c => c.keyHex === session.senderHex);
-            const senderName = c ? c.nickname : '?';
-            log(`[${srv.name}] Message from ${senderName}: "${text.substring(0, 40)}..."`);
+            const senderName = c ? c.nickname : session.senderHex.substring(0, 16) + '...';
+            log(`[${srv.name}] Message received from ${senderName} (j=${session.j}, ${text.length} chars): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
             notifyNewMessage(senderName, text);
             scrollMessages();
+        }
+
+        const SENT_MAP_TTL = 365 * 24 * 60 * 60 * 1000; // 1 year in ms
+
+        function cleanSentMessageMap() {
+            const now = Date.now();
+            for (const sid of Object.keys(sentMessageMap)) {
+                const entry = sentMessageMap[sid];
+                if (entry.ts && now - entry.ts > SENT_MAP_TTL) {
+                    delete sentMessageMap[sid];
+                }
+            }
         }
 
         function handleMsgStatus(payload, newStatus) {
@@ -715,16 +889,18 @@ createApp({
             const info = sentMessageMap[sid];
             if (!info) return;
             const msgList = messages[info.destHex];
+            const c = contacts.find(c => c.keyHex === info.destHex);
+            const dest = c ? c.nickname : info.destHex.substring(0, 16) + '...';
             if (msgList && msgList[info.msgIndex]) {
                 msgList[info.msgIndex].status = newStatus;
-                saveMessages();
+                saveMessages(info.destHex);
+                log(`Message to ${dest} → ${newStatus}`);
             }
-            if (newStatus === 'delivered') delete sentMessageMap[sid];
+            delete sentMessageMap[sid];
+            cleanSentMessageMap();
         }
 
         // === SEND MESSAGE ===
-        /** Encrypt and send a message to the active contact.
-         *  Steps: Koblitz encode -> DH encrypt -> MO encrypt -> send to server */
         function sendMessage() {
             if (!messageInput.value.trim() || !activeContact.value) return;
             const text = messageInput.value.trim();
@@ -735,22 +911,29 @@ createApp({
             const srv = servers[srvIdx];
 
             const [mPoint, j] = koblitz.encode(text);
+            log(`Koblitz encode: "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}" → point (j=${j})`);
             const destPt = hexToPoint(destHex);
             const destPubKey = Point.decompress(destPt.x, destPt.parity, curve);
             const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
             const shared = dh.computeSharedSecret(destPubKey);
+            log(`DH shared secret computed (x: ${shared.x.toString(16).substring(0, 16)}...)`);
             const ePoint = mPoint.mul(shared.x);
+            log(`DH encrypt: E = M * shared.x (E.x: ${ePoint.x.toString(16).substring(0, 16)}...)`);
             const c1Point = srv.mo.encrypt(ePoint);
+            log(`MO encrypt: C1 = mo.encrypt(E) (C1.x: ${c1Point.x.toString(16).substring(0, 16)}...)`);
             const [c1X, c1Parity] = c1Point.compress();
+
+            const [eX, eParity] = ePoint.compress();
 
             if (!messages[destHex]) messages[destHex] = [];
             const msgIndex = messages[destHex].length;
-            messages[destHex].push({ text, sent: true, time: new Date().toLocaleTimeString(), status: 'sending' });
-            saveMessages();
+            messages[destHex].push({ text, sent: true, time: new Date().toLocaleTimeString(), ts: Date.now(), status: 'sending', e_x: eX.toString(16), e_parity: Number(eParity), j });
+            saveMessages(destHex);
 
-            pendingSendSessions['_next_send_' + srvIdx] = { moInstance: srv.mo, destHex, j, msgIndex };
+            if (!pendingSendQueues[srvIdx]) pendingSendQueues[srvIdx] = [];
+            pendingSendQueues[srvIdx].push({ moInstance: srv.mo, destHex, j, msgIndex, srvIdx });
 
-            log(`[${srv.name}] >> MO_SEND_INIT to ${activeContact.value.nickname}`);
+            log(`[${srv.name}] >> MO_SEND_INIT to ${activeContact.value.nickname} (j=${j}, ${text.length} chars)`);
             srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, j, c1X, c1Parity));
 
             messageInput.value = '';
