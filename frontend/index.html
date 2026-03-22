@@ -205,6 +205,12 @@
                                     <span v-else-if="msg.status === 'queued'" class="status-icon">&#9719;</span>
                                     <span v-else class="status-icon">&#8987;</span>
                                 </span>
+                                <span v-if="!msg.sent" class="sig-status" :class="{ verified: msg.verified, unverified: msg.verified === false, unsigned: msg.verified === undefined }"
+                                      :title="msg.verified ? 'Signature verified' : msg.verified === false ? 'Invalid signature' : 'No signature'">
+                                    <span v-if="msg.verified" class="sig-icon">&#128274;</span>
+                                    <span v-else-if="msg.verified === false" class="sig-icon sig-warn">&#9888;</span>
+                                    <span v-else class="sig-icon sig-none">&#128275;</span>
+                                </span>
                             </div>
                         </div>
                     </div>

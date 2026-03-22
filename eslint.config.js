@@ -1,5 +1,8 @@
 export default [
     {
+        ignores: ["frontend/vendor/**"],
+    },
+    {
         files: ["frontend/**/*.js"],
         ignores: ["frontend/sw.js"],
         languageOptions: {
@@ -22,6 +25,13 @@ export default [
                 Vue: "readonly",
                 ecutils: "readonly",
                 Protocol: "readonly",
+                indexedDB: "readonly",
+                Blob: "readonly",
+                URL: "readonly",
+                FileReader: "readonly",
+                Notification: "readonly",
+                Worker: "readonly",
+                location: "readonly",
             },
         },
         rules: {

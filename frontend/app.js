@@ -2,13 +2,15 @@
  * e2hat - End-to-end encrypted chat with elliptic curves.
  *
  * Cryptographic flow for sending a message:
- *   1. Koblitz.encode(text) -> (M, j)          Text becomes a curve point
- *   2. E = M * shared.x                        DH encryption (shared = DH with recipient)
- *   3. C1 = mo.encrypt(E)                      MO layer for transit to server
- *   4. Server 3-pass (SEND_INIT/STEP2/STEP3)   Server receives E without seeing M
- *   5. Server 3-pass (RECV_INIT/STEP2/STEP3)   Receiver gets E
- *   6. M = E * modInverse(shared.x, n)          DH decryption
- *   7. Koblitz.decode(M, j) -> text             Curve point becomes text
+ *   1. Koblitz.encode(nonce + text) -> (M, j)   Text becomes a curve point (nonce for non-determinism)
+ *   2. E = M * S.x                              Encrypt with DH shared secret S = DH(privA, pubB)
+ *   3. ECDSA.sign(E.x, timestamp, dest)         Sign for authentication and anti-replay
+ *   4. C1 = mo.encrypt(E)                       MO layer for transit to server
+ *   5. Server 3-pass (SEND_INIT/STEP2/STEP3)    Server receives E without seeing M
+ *   6. Server 3-pass (RECV_INIT/STEP2/STEP3)    Receiver gets E + signature
+ *   7. ECDSA.verify(sig, sender_pubkey)          Verify authenticity
+ *   8. M = E * modInverse(S.x, n)               Decrypt with DH shared secret
+ *   9. Koblitz.decode(M, j) -> nonce + text      Curve point becomes text (strip nonce)
  *
  * The server only ever sees E (encrypted with DH). It cannot derive the DH
  * shared secret because it doesn't have either party's private key.
@@ -18,13 +20,25 @@
  */
 
 const { createApp, ref, reactive, computed, nextTick, watch } = Vue;
-const { Point, DiffieHellman, MasseyOmura, Koblitz, getCurve } = ecutils;
+const { Point, DiffieHellman, MasseyOmura, Koblitz, DigitalSignature, getCurve } = ecutils;
 
 const CURVE_NAME = 'secp521r1';
 const curve = getCurve(CURVE_NAME);
 const P = Protocol;
 
 // --- Cryptographic utilities ---
+
+/** Generate a random 4-char string (nonce) for message padding */
+function generateNonce() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    const randomVals = new Uint8Array(4);
+    crypto.getRandomValues(randomVals);
+    for (let i = 0; i < 4; i++) {
+        result += chars[randomVals[i] % chars.length];
+    }
+    return result;
+}
 
 /** Generate a random private key in range [2, n-1] for secp521r1. */
 function randomPrivateKey() {
@@ -74,34 +88,59 @@ function modInverse(a, m) {
     return ((old_s % m) + m) % m;
 }
 
-// --- Key derivation and encryption ---
+// --- Key derivation and encryption (AES-GCM) ---
 
-/** SHA-256(password) -> Koblitz.encode(hash_hex) -> point.x */
-async function deriveKeyFromPassword(password) {
-    const data = new TextEncoder().encode(password);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashHex = Array.from(new Uint8Array(hashBuffer), b => b.toString(16).padStart(2, '0')).join('');
-    const kob = new Koblitz(CURVE_NAME);
-    const [point] = kob.encode(hashHex);
-    return point.x;
+/** Hex string -> Uint8Array */
+function hexToBytes(hex) {
+    return new Uint8Array(hex.match(/.{1,2}/g).map(b => parseInt(b, 16)));
 }
 
-/** SHA-256 fingerprint of derived key for password verification. */
-async function hashCheck(dk) {
-    const data = new TextEncoder().encode(dk.toString(16));
-    const buf = await crypto.subtle.digest('SHA-256', data);
-    return Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
+/** Uint8Array -> hex string */
+function bytesToHex(bytes) {
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** (key + derived) mod n */
-function encryptKey(privateKey, derivedKey) {
-    return ((privateKey + derivedKey) % curve.n).toString(16);
+/** PBKDF2-HMAC-SHA256(password, salt) -> AES-GCM CryptoKey + salt hex */
+async function deriveAesKey(password, saltHex) {
+    const encoder = new TextEncoder();
+    const passKey = await crypto.subtle.importKey(
+        'raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']
+    );
+    const salt = saltHex ? hexToBytes(saltHex) : crypto.getRandomValues(new Uint8Array(16));
+    const aesKey = await crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt, iterations: 600000, hash: 'SHA-256' },
+        passKey,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+    );
+    return { aesKey, salt: bytesToHex(salt) };
 }
 
-/** (encrypted - derived) mod n */
-function decryptKey(encryptedHex, derivedKey) {
-    const encrypted = BigInt('0x' + encryptedHex);
-    return ((encrypted - derivedKey) % curve.n + curve.n) % curve.n;
+/** Encrypt plaintext bytes with AES-GCM. Returns {iv, ciphertext} as hex. */
+async function aesGcmEncrypt(aesKey, plaintext) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, plaintext);
+    return { iv: bytesToHex(iv), ciphertext: bytesToHex(new Uint8Array(ct)) };
+}
+
+/** Decrypt AES-GCM ciphertext. Returns plaintext Uint8Array. */
+async function aesGcmDecrypt(aesKey, ivHex, ciphertextHex) {
+    const iv = hexToBytes(ivHex);
+    const ct = hexToBytes(ciphertextHex);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, ct);
+    return new Uint8Array(pt);
+}
+
+/** Encode a BigInt private key as fixed-length bytes for AES-GCM encryption. */
+function bigintToFixedBytes(value, len = 66) {
+    const hex = value.toString(16).padStart(len * 2, '0');
+    return hexToBytes(hex);
+}
+
+/** Decode fixed-length bytes back to BigInt. */
+function fixedBytesToBigint(bytes) {
+    return BigInt('0x' + bytesToHex(bytes));
 }
 
 // --- IndexedDB storage ---
@@ -217,6 +256,7 @@ createApp({
         const pendingRecvSessions = reactive({});
         const sentMessageMap = reactive({});
         const retryQueues = {};
+        const seenSignatures = new Set(); // Anti-replay: track received signature fingerprints
 
         const koblitz = new Koblitz(CURVE_NAME);
         const messagesEl = ref(null);
@@ -394,7 +434,9 @@ createApp({
                         }
                         const ePoint = Point.decompress(BigInt('0x' + m.e_x), BigInt(m.e_parity), curve);
                         const mPoint = ePoint.mul(invCache[contactHex]);
-                        return { ...m, text: koblitz.decode(mPoint, m.j) };
+                        let decoded = koblitz.decode(mPoint, m.j);
+                        if (m.nonce) decoded = decoded.substring(NONCE_LEN);
+                        return { ...m, text: decoded };
                     } catch {
                         return { ...m, text: '[decrypt error]' };
                     }
@@ -434,12 +476,13 @@ createApp({
             status.value = 'Encrypting keys...';
             setTimeout(async () => {
                 try {
-                    const dk = await deriveKeyFromPassword(savePassword.value);
-                    const check = await hashCheck(dk);
+                    const { aesKey, salt } = await deriveAesKey(savePassword.value);
+                    const dhEnc = await aesGcmEncrypt(aesKey, bigintToFixedBytes(dhPrivateKey.value));
+                    const moEnc = await aesGcmEncrypt(aesKey, bigintToFixedBytes(moPrivateKey.value));
                     await idbPut('keys', 'encrypted', {
-                        dh: encryptKey(dhPrivateKey.value, dk),
-                        mo: encryptKey(moPrivateKey.value, dk),
-                        check,
+                        dh_iv: dhEnc.iv, dh_ct: dhEnc.ciphertext,
+                        mo_iv: moEnc.iv, mo_ct: moEnc.ciphertext,
+                        salt,
                     });
                     await idbPut('config', 'nickname', nickname.value);
                     keysSaved.value = true;
@@ -457,14 +500,11 @@ createApp({
                 try {
                     const data = await idbGet('keys', 'encrypted');
                     if (!data) { status.value = 'No saved keys'; return; }
-                    const dk = await deriveKeyFromPassword(restorePassword.value);
-                    const check = await hashCheck(dk);
-                    if (data.check && data.check !== check) {
-                        status.value = 'Wrong password';
-                        return;
-                    }
-                    const dhKey = decryptKey(data.dh, dk);
-                    const moKey = decryptKey(data.mo, dk);
+                    const { aesKey } = await deriveAesKey(restorePassword.value, data.salt);
+                    const dhBytes = await aesGcmDecrypt(aesKey, data.dh_iv, data.dh_ct);
+                    const moBytes = await aesGcmDecrypt(aesKey, data.mo_iv, data.mo_ct);
+                    const dhKey = fixedBytesToBigint(dhBytes);
+                    const moKey = fixedBytesToBigint(moBytes);
                     const dh = new DiffieHellman(dhKey, CURVE_NAME);
                     dhPrivateKey.value = dhKey;
                     dhPublicKey.value = dh.publicKey;
@@ -621,7 +661,7 @@ createApp({
         function scheduleReconnect(index) {
             if (reconnectTimers[index]) return;
             const srv = servers[index];
-            if (srv._manualDisconnect) return;
+            if (!srv || srv._manualDisconnect) return;
             const delay = Math.min(30000, 2000 * Math.pow(2, srv._retries || 0));
             srv._retries = (srv._retries || 0) + 1;
             log(`[${srv.name}] Reconnecting in ${Math.round(delay / 1000)}s...`);
@@ -679,6 +719,7 @@ createApp({
 
         function disconnectServer(index) {
             const srv = servers[index];
+            if (!srv) return;
             srv._manualDisconnect = true;
             if (reconnectTimers[index]) { timerWorker.postMessage({ action: 'cancel', id: index }); delete reconnectTimers[index]; }
             if (srv.ws) { srv.ws.close(); srv.ws = null; }
@@ -690,6 +731,7 @@ createApp({
         // === PROTOCOL HANDLER (per server) ===
         function handleServerMessage(srvIdx, data) {
             const srv = servers[srvIdx];
+            if (!srv) return;
             const { msgType, payload } = P.unpackFrame(data);
             const typeName = {
                 [P.WELCOME]: 'WELCOME', [P.MO_SEND_STEP2]: 'MO_SEND_STEP2',
@@ -702,6 +744,20 @@ createApp({
             switch (msgType) {
                 case P.WELCOME: {
                     const wInfo = P.unpackWelcome(payload);
+                    log(`[${srv.name}] Received challenge, generating ECDSA signature...`);
+
+                    // Create digital signature instance with our DH private key
+                    const signer = new DigitalSignature(dhPrivateKey.value, CURVE_NAME);
+
+                    // Convert challenge bytes to BigInt for signing
+                    const challengeHex = Array.from(wInfo.challenge, b => b.toString(16).padStart(2, '0')).join('');
+                    const challengeInt = BigInt('0x' + challengeHex);
+
+                    // Sign and send AUTH
+                    const [r, s] = signer.sign(challengeInt);
+                    srv.ws.send(P.packAuth(r, s));
+                    log(`[${srv.name}] >> AUTH sent`);
+
                     srv.state = 'connected';
                     log(`[${srv.name}] Handshake complete (MO pub ${wInfo.x.toString(16).substring(0, 12)}...)`);
                     // Retry 'sending' messages on this server
@@ -756,6 +812,7 @@ createApp({
         /** MO send step 2: strip our MO layer -> C3 = mo.decrypt(C2), send back. */
         function handleMoSendStep2(srvIdx, payload) {
             const srv = servers[srvIdx];
+            if (!srv || !srv.ws) return;
             const { sessionId, x, parity } = P.unpackMoSendStep2(payload);
 
             let session = pendingSendSessions[sessionId];
@@ -786,7 +843,7 @@ createApp({
         }
 
         /** Drain one retry from the queue; next fires after step2 completes. */
-        function flushNextRetry(srvIdx) {
+        async function flushNextRetry(srvIdx) {
             const queue = retryQueues[srvIdx];
             if (!queue || !queue.length) return;
             const srv = servers[srvIdx];
@@ -798,6 +855,12 @@ createApp({
             const c1Point = srv.mo.encrypt(ePoint);
             const [c1X, c1Parity] = c1Point.compress();
 
+            // Re-sign with fresh timestamp for retry
+            const timestampMs = Date.now();
+            const sigPayload = `${ePoint.x.toString(16)}:${timestampMs}:${item.destHex}`;
+            const signer = new DigitalSignature(dhPrivateKey.value, CURVE_NAME);
+            const [sigR, sigS] = await signer.signMessage(sigPayload);
+
             if (!pendingSendQueues[srvIdx]) pendingSendQueues[srvIdx] = [];
             pendingSendQueues[srvIdx].push({
                 moInstance: srv.mo, destHex: item.destHex, j: item.j,
@@ -805,14 +868,15 @@ createApp({
             });
 
             const retryDest = contacts.find(c => c.keyHex === item.destHex);
-            log(`[${srv.name}] >> MO_SEND_INIT (retry to ${retryDest ? retryDest.nickname : item.destHex.substring(0, 16) + '...'}, j=${item.j})`);
-            srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, item.j, c1X, c1Parity));
+            log(`[${srv.name}] >> MO_SEND_INIT (retry to ${retryDest ? retryDest.nickname : item.destHex.substring(0, 16) + '...'}, j=${item.j}, signed)`);
+            srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, item.j, c1X, c1Parity, sigR, sigS, timestampMs));
         }
 
         /** MO recv step 1: add our MO layer -> C2' = mo.encrypt(C1'), send back. */
         function handleMoRecvInit(srvIdx, payload) {
             const srv = servers[srvIdx];
-            const { sessionId, senderX, senderParity, j, c1X, c1Parity } = P.unpackMoRecvInit(payload);
+            if (!srv || !srv.ws) return;
+            const { sessionId, senderX, senderParity, j, c1X, c1Parity, sigR, sigS, timestampMs } = P.unpackMoRecvInit(payload);
             const senderHex = pointToHex(senderX, senderParity);
 
             const c1Point = Point.decompress(c1X, c1Parity, curve);
@@ -822,15 +886,16 @@ createApp({
             log(`[${srv.name}] MO encrypt: C2' = mo.encrypt(C1') (C2'.x: ${c2Point.x.toString(16).substring(0, 16)}...)`);
             const [c2X, c2Parity] = c2Point.compress();
 
-            pendingRecvSessions[sessionId] = { serverIndex: srvIdx, moInstance: srv.mo, senderHex, j };
+            pendingRecvSessions[sessionId] = { serverIndex: srvIdx, moInstance: srv.mo, senderHex, j, sigR, sigS, timestampMs };
 
             log(`[${srv.name}] >> MO_RECV_STEP2 (sid=${sessionId})`);
             srv.ws.send(P.packMoRecvStep2(sessionId, c2X, c2Parity));
         }
 
         /** MO recv step 3: strip MO -> E, then DH decrypt -> M, Koblitz decode -> text. */
-        function handleMoRecvStep3(srvIdx, payload) {
+        async function handleMoRecvStep3(srvIdx, payload) {
             const srv = servers[srvIdx];
+            if (!srv) return;
             const { sessionId, x, parity } = P.unpackMoRecvStep3(payload);
 
             const session = pendingRecvSessions[sessionId];
@@ -841,22 +906,61 @@ createApp({
             log(`[${srv.name}] MO decrypt: E = mo.decrypt(C3') (E.x: ${ePoint.x.toString(16).substring(0, 16)}...)`);
             const [recvEX, recvEParity] = ePoint.compress();
 
+            // Verify ECDSA signature on E.x:timestamp:dest (hashed internally by signMessage/verifyMessage)
+            let verified = false;
             const senderPt = hexToPoint(session.senderHex);
             const senderPubKey = Point.decompress(senderPt.x, senderPt.parity, curve);
+            if (session.sigR && session.sigS && session.timestampMs) {
+                // Anti-replay: reject duplicate signatures
+                const sigFingerprint = `${session.sigR.toString(16).substring(0, 32)}:${session.sigS.toString(16).substring(0, 32)}`;
+                if (seenSignatures.has(sigFingerprint)) {
+                    log(`[${srv.name}] REPLAY BLOCKED: duplicate signature detected, dropping message`);
+                    delete pendingRecvSessions[sessionId];
+                    return;
+                }
+                try {
+                    const age = Date.now() - session.timestampMs;
+                    const MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
+                    if (age > MAX_AGE) {
+                        log(`[${srv.name}] ECDSA: message too old (${Math.round(age / 1000)}s), rejecting`);
+                    } else {
+                        const sigPayload = `${ePoint.x.toString(16)}:${session.timestampMs}:${myPubKeyHex.value}`;
+                        const verifier = new DigitalSignature(1n, CURVE_NAME);
+                        verified = await verifier.verifyMessage(senderPubKey, sigPayload, session.sigR, session.sigS);
+                        log(`[${srv.name}] ECDSA verify: ${verified ? 'VALID' : 'INVALID'} signature (age: ${Math.round(age / 1000)}s)`);
+                        if (verified) {
+                            seenSignatures.add(sigFingerprint);
+                            // Prune old entries to prevent memory growth (keep last 10000)
+                            if (seenSignatures.size > 10000) {
+                                const first = seenSignatures.values().next().value;
+                                seenSignatures.delete(first);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    log(`[${srv.name}] ECDSA verify error: ${e.message}`);
+                }
+            } else {
+                log(`[${srv.name}] No signature attached (unsigned message)`);
+            }
+
             const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
             const shared = dh.computeSharedSecret(senderPubKey);
             log(`[${srv.name}] DH shared secret computed (x: ${shared.x.toString(16).substring(0, 16)}...)`);
             const invX = modInverse(shared.x, curve.n);
             const mPoint = ePoint.mul(invX);
             log(`[${srv.name}] DH decrypt: M = E * shared.x⁻¹ (M.x: ${mPoint.x.toString(16).substring(0, 16)}...)`);
-            const text = koblitz.decode(mPoint, session.j);
-            log(`[${srv.name}] Koblitz decode: point → "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}" (j=${session.j})`);
+            const paddedText = koblitz.decode(mPoint, session.j);
+            // Strip the 4-char nonce prefix
+            const text = paddedText.length > NONCE_LEN ? paddedText.substring(NONCE_LEN) : paddedText;
+            log(`[${srv.name}] Koblitz decode: stripped nonce → "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}" (j=${session.j})`);
 
             ensureContact(session.senderHex);
 
             if (!messages[session.senderHex]) messages[session.senderHex] = [];
             messages[session.senderHex].push({
                 text, sent: false, time: new Date().toLocaleTimeString(), ts: Date.now(),
+                verified, nonce: true,
                 e_x: recvEX.toString(16), e_parity: Number(recvEParity), j: session.j,
             });
             saveMessages(session.senderHex);
@@ -867,7 +971,7 @@ createApp({
             delete pendingRecvSessions[sessionId];
             const c = contacts.find(c => c.keyHex === session.senderHex);
             const senderName = c ? c.nickname : session.senderHex.substring(0, 16) + '...';
-            log(`[${srv.name}] Message received from ${senderName} (j=${session.j}, ${text.length} chars): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+            log(`[${srv.name}] Message received from ${senderName} (j=${session.j}, ${text.length} chars, ${verified ? 'verified' : 'unverified'}): "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
             notifyNewMessage(senderName, text);
             scrollMessages();
         }
@@ -901,7 +1005,8 @@ createApp({
         }
 
         // === SEND MESSAGE ===
-        const KOBLITZ_MAX = 55;
+        const NONCE_LEN = 4;
+        const KOBLITZ_MAX = 51; // secp521r1 Koblitz limit (55) minus nonce prefix
 
         /** Split text into chunks <= KOBLITZ_MAX, breaking at spaces when possible. */
         function splitText(text) {
@@ -917,10 +1022,13 @@ createApp({
             return parts;
         }
 
-        function sendChunk(chunkText, destHex, srvIdx) {
+        async function sendChunk(chunkText, destHex, srvIdx) {
             const srv = servers[srvIdx];
-            const [mPoint, j] = koblitz.encode(chunkText);
-            log(`Koblitz encode: "${chunkText.substring(0, 30)}${chunkText.length > 30 ? '...' : ''}" → point (j=${j})`);
+            // Prepend random nonce to make encryption non-deterministic
+            const nonce = generateNonce();
+            const paddedText = nonce + chunkText;
+            const [mPoint, j] = koblitz.encode(paddedText);
+            log(`Koblitz encode: nonce="${nonce}" + "${chunkText.substring(0, 26)}${chunkText.length > 26 ? '...' : ''}" → point (j=${j})`);
             const destPt = hexToPoint(destHex);
             const destPubKey = Point.decompress(destPt.x, destPt.parity, curve);
             const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
@@ -928,6 +1036,14 @@ createApp({
             log(`DH shared secret computed (x: ${shared.x.toString(16).substring(0, 16)}...)`);
             const ePoint = mPoint.mul(shared.x);
             log(`DH encrypt: E = M * shared.x (E.x: ${ePoint.x.toString(16).substring(0, 16)}...)`);
+
+            // Sign SHA-256(E.x || timestamp || destHex) for anti-replay
+            const timestampMs = Date.now();
+            const sigPayload = `${ePoint.x.toString(16)}:${timestampMs}:${destHex}`;
+            const signer = new DigitalSignature(dhPrivateKey.value, CURVE_NAME);
+            const [sigR, sigS] = await signer.signMessage(sigPayload);
+            log(`ECDSA sign: sig(E.x:ts:dest) = (r: ${sigR.toString(16).substring(0, 12)}..., s: ${sigS.toString(16).substring(0, 12)}...)`);
+
             const c1Point = srv.mo.encrypt(ePoint);
             log(`MO encrypt: C1 = mo.encrypt(E) (C1.x: ${c1Point.x.toString(16).substring(0, 16)}...)`);
             const [c1X, c1Parity] = c1Point.compress();
@@ -935,14 +1051,14 @@ createApp({
 
             if (!messages[destHex]) messages[destHex] = [];
             const msgIndex = messages[destHex].length;
-            messages[destHex].push({ text: chunkText, sent: true, time: new Date().toLocaleTimeString(), ts: Date.now(), status: 'sending', e_x: eX.toString(16), e_parity: Number(eParity), j });
+            messages[destHex].push({ text: chunkText, sent: true, time: new Date().toLocaleTimeString(), ts: timestampMs, status: 'sending', e_x: eX.toString(16), e_parity: Number(eParity), j, nonce: true });
             saveMessages(destHex);
 
             if (!pendingSendQueues[srvIdx]) pendingSendQueues[srvIdx] = [];
             pendingSendQueues[srvIdx].push({ moInstance: srv.mo, destHex, j, msgIndex, srvIdx });
 
-            log(`[${srv.name}] >> MO_SEND_INIT to ${activeContact.value.nickname} (j=${j}, ${chunkText.length} chars)`);
-            srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, j, c1X, c1Parity));
+            log(`[${srv.name}] >> MO_SEND_INIT to ${activeContact.value.nickname} (j=${j}, ${chunkText.length} chars, signed)`);
+            srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, j, c1X, c1Parity, sigR, sigS, timestampMs));
         }
 
         function sendMessage() {
@@ -987,8 +1103,9 @@ createApp({
         }
 
         function removeServer(index) {
-            disconnectServer(index);
             const s = servers[index];
+            if (!s) return;
+            disconnectServer(index);
             log(`Server removed: ${s.name}`);
             servers.splice(index, 1);
             saveServers();

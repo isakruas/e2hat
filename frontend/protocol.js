@@ -17,7 +17,8 @@ const POINT_SIZE = 67;
 
 // Handshake
 const HELLO = 0x01;          // Client -> Server: here is my DH public key
-const WELCOME = 0x02;        // Server -> Client: here is your MO public key
+const WELCOME = 0x02;        // Server -> Client: here is your MO public key + 32b challenge
+const AUTH = 0x03;           // Client -> Server: here is the signature of the challenge
 
 // Sender-side Massey-Omura 3-pass
 const MO_SEND_INIT = 0x10;   // Client sends C1 = mo.encrypt(E) + destination
@@ -102,13 +103,38 @@ function packHello(pubkeyX, pubkeyParity) {
     return packFrame(HELLO, packPoint(pubkeyX, pubkeyParity));
 }
 
-function packMoSendInit(destX, destParity, j, c1X, c1Parity) {
+function packAuth(r, s) {
+    const payload = new Uint8Array(COORD_SIZE * 2);
+    payload.set(bigintToBytes(r, COORD_SIZE), 0);
+    payload.set(bigintToBytes(s, COORD_SIZE), COORD_SIZE);
+    return packFrame(AUTH, payload);
+}
+
+function unpackAuth(payload) {
+    const r = bytesToBigint(payload, 0, COORD_SIZE);
+    const s = bytesToBigint(payload, COORD_SIZE, COORD_SIZE);
+    return { r, s };
+}
+
+function packMoSendInit(destX, destParity, j, c1X, c1Parity, sigR, sigS, timestampMs) {
     const dest = packPoint(destX, destParity);
     const c1 = packPoint(c1X, c1Parity);
-    const payload = new Uint8Array(POINT_SIZE + 1 + POINT_SIZE);
+    const hasSig = sigR !== undefined && sigS !== undefined;
+    const len = POINT_SIZE + 1 + POINT_SIZE + (hasSig ? COORD_SIZE * 2 + 8 : 0);
+    const payload = new Uint8Array(len);
     payload.set(dest, 0);
     payload[POINT_SIZE] = j;
     payload.set(c1, POINT_SIZE + 1);
+    if (hasSig) {
+        const sigOff = POINT_SIZE + 1 + POINT_SIZE;
+        payload.set(bigintToBytes(sigR, COORD_SIZE), sigOff);
+        payload.set(bigintToBytes(sigS, COORD_SIZE), sigOff + COORD_SIZE);
+        const tsOff = sigOff + COORD_SIZE * 2;
+        const dv = new DataView(payload.buffer);
+        // Write 64-bit timestamp as two 32-bit halves
+        dv.setUint32(tsOff, Math.floor(timestampMs / 0x100000000));
+        dv.setUint32(tsOff + 4, timestampMs >>> 0);
+    }
     return packFrame(MO_SEND_INIT, payload);
 }
 
@@ -133,7 +159,9 @@ function packMoRecvStep2(sessionId, c2X, c2Parity) {
 // --- Unpack functions ---
 
 function unpackWelcome(payload) {
-    return unpackPoint(payload);
+    const { x, parity, nextOffset } = unpackPoint(payload);
+    const challenge = payload.slice(nextOffset, nextOffset + 32);
+    return { x, parity, challenge };
 }
 
 function unpackMoSendStep2(payload) {
@@ -152,6 +180,15 @@ function unpackMoRecvInit(payload) {
     const j = payload[off];
     off += 1;
     const c1 = unpackPoint(payload, off);
+    off = c1.nextOffset;
+    let sigR, sigS, timestampMs;
+    if (payload.length >= off + COORD_SIZE * 2 + 8) {
+        sigR = bytesToBigint(payload, off, COORD_SIZE);
+        sigS = bytesToBigint(payload, off + COORD_SIZE, COORD_SIZE);
+        const tsOff = off + COORD_SIZE * 2;
+        const tsDv = new DataView(payload.buffer, payload.byteOffset + tsOff, 8);
+        timestampMs = tsDv.getUint32(0) * 0x100000000 + tsDv.getUint32(4);
+    }
     return {
         sessionId,
         senderX: sender.x,
@@ -159,6 +196,9 @@ function unpackMoRecvInit(payload) {
         j,
         c1X: c1.x,
         c1Parity: c1.parity,
+        sigR,
+        sigS,
+        timestampMs,
     };
 }
 
@@ -183,7 +223,7 @@ function unpackSessionId(payload) {
 }
 
 window.Protocol = {
-    HELLO, WELCOME,
+    HELLO, WELCOME, AUTH,
     MO_SEND_INIT, MO_SEND_STEP2, MO_SEND_STEP3,
     MO_RECV_INIT, MO_RECV_STEP2, MO_RECV_STEP3,
     ERROR, PEER_ONLINE, PEER_OFFLINE,
@@ -193,7 +233,7 @@ window.Protocol = {
     bigintToBytes, bytesToBigint,
     packPoint, unpackPoint,
     packFrame, unpackFrame,
-    packHello, packMoSendInit, packMoSendStep3, packMoRecvStep2,
+    packHello, packAuth, packMoSendInit, packMoSendStep3, packMoRecvStep2,
     unpackWelcome, unpackMoSendStep2, unpackMoRecvInit, unpackMoRecvStep3,
     unpackError, unpackPeerEvent, unpackSessionId,
 };

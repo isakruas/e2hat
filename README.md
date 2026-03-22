@@ -15,6 +15,8 @@ A messaging application with end-to-end encryption based on solid mathematical p
 - **Koblitz encoding** converts text into points on an elliptic curve
 - **Diffie-Hellman key exchange** creates a shared secret between two people without ever transmitting the secret itself
 - **Massey-Omura three-pass protocol** relays encrypted messages through the server without the server ever seeing the plaintext
+- **ECDSA digital signatures** authenticate every message — the receiver can verify that a message truly came from the stated sender
+- **Challenge-response authentication** proves identity to the relay server during handshake using ECDSA
 
 All operations use the **secp521r1** curve — a well-established, peer-reviewed standard.
 
@@ -27,17 +29,19 @@ Alice                         Server                          Bob
   |                              |                              |
   |  1. Koblitz: text -> point   |                              |
   |  2. DH: encrypt with shared  |                              |
-  |  3. MO: encrypt for transit  |                              |
-  |  -------encrypted point----> |                              |
+  |  3. ECDSA: sign E.x          |                              |
+  |  4. MO: encrypt for transit  |                              |
+  |  ---encrypted point + sig--> |                              |
   |                              | (server cannot read this)    |
-  |                              | -------encrypted point-----> |
+  |                              | ---encrypted point + sig---> |
   |                              |                              |
-  |                              |  4. MO: decrypt transit layer |
-  |                              |  5. DH: decrypt with shared   |
-  |                              |  6. Koblitz: point -> text    |
+  |                              |  5. MO: decrypt transit layer |
+  |                              |  6. ECDSA: verify signature   |
+  |                              |  7. DH: decrypt with shared   |
+  |                              |  8. Koblitz: point -> text    |
 ```
 
-The Massey-Omura protocol adds a three-step exchange so that even the transit encryption doesn't require pre-shared keys between the client and server.
+The Massey-Omura protocol adds a three-step exchange so that even the transit encryption doesn't require pre-shared keys between the client and server. The ECDSA signature travels alongside the encrypted message through the relay, allowing the receiver to verify that the message genuinely came from the claimed sender.
 
 ## Design principles
 

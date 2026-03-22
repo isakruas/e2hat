@@ -99,6 +99,9 @@ class SessionManager:
                         "e_parity": meta["e_parity"],
                         "send_sid": meta.get("send_sid"),
                         "queued_at": meta.get("queued_at"),
+                        "sig_r": meta.get("sig_r"),
+                        "sig_s": meta.get("sig_s"),
+                        "timestamp_ms": meta.get("timestamp_ms"),
                     })
         for sid in to_remove:
             self._sessions.pop(sid, None)
