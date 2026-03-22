@@ -40,6 +40,7 @@
         <div v-if="screen === 'setup'" class="setup">
             <h1>e2hat</h1>
             <p class="subtitle">End-to-end encrypted chat with elliptic curves</p>
+            <p class="version-link">v0.1.0 &mdash; <a href="https://github.com/isakruas/e2hat" target="_blank" rel="noopener">GitHub</a></p>
 
             <!-- Restore saved keys -->
             <div v-if="hasSavedKeys && !restoredKeys" class="restore-box">
@@ -56,6 +57,10 @@
                 <button @click="generateKeys" :disabled="!!compressedPubKeyDisplay">
                     Generate Keys
                 </button>
+                <button class="secondary" @click="triggerImport" :disabled="!!compressedPubKeyDisplay">
+                    Import Keys
+                </button>
+                <input type="file" accept=".json" ref="importFileInput" @change="importKeys" style="display:none" />
 
                 <div v-if="compressedPubKeyDisplay" class="info copyable" @click="copyPubKey">
                     <strong>Your public key <span class="copy-hint">(tap to copy)</span>:</strong><br>
@@ -69,6 +74,11 @@
                     <button @click="saveKeys" :disabled="!savePassword.trim()">Save Keys Locally</button>
                 </div>
                 <div v-if="keysSaved" class="status">Keys saved encrypted in localStorage</div>
+
+                <!-- Export keys -->
+                <button v-if="compressedPubKeyDisplay" class="secondary" @click="exportKeys">
+                    Export Keys
+                </button>
 
                 <button @click="enterChat" :disabled="!nickname.trim() || !compressedPubKeyDisplay">
                     Enter Chat
@@ -109,7 +119,7 @@
                 </div>
                 <div v-if="showAddServer" class="add-server">
                     <input v-model="newServerName" placeholder="Server name" />
-                    <input v-model="newServerUrl" placeholder="ws://host:port/ws" />
+                    <input v-model="newServerUrl" placeholder="wss://host/ws" />
                     <button @click="addServer">Add Server</button>
                 </div>
 
@@ -226,8 +236,8 @@
         </div>
     </div>
 
-    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-    <script src="https://unpkg.com/js-ecutils@latest/dist/web/min.js"></script>
+    <script src="vendor/vue.global.prod.js"></script>
+    <script src="vendor/ecutils.min.js"></script>
     <script src="protocol.js"></script>
     <script src="app.js"></script>
     <script>

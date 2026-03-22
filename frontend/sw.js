@@ -1,4 +1,5 @@
-const CACHE_NAME = 'e2hat-v1';
+const today = new Date().toISOString().slice(0, 10);
+const CACHE_NAME = 'e2hat-' + today;
 const STATIC_ASSETS = [
     './',
     './index.html',
@@ -6,8 +7,8 @@ const STATIC_ASSETS = [
     './protocol.js',
     './app.js',
     './icon.svg',
-    'https://unpkg.com/vue@3/dist/vue.global.prod.js',
-    'https://unpkg.com/js-ecutils@latest/dist/web/min.js',
+    './vendor/vue.global.prod.js',
+    './vendor/ecutils.min.js',
 ];
 
 self.addEventListener('install', (event) => {
@@ -23,6 +24,18 @@ self.addEventListener('activate', (event) => {
         caches.keys().then((names) =>
             Promise.all(names.map((n) => n !== CACHE_NAME ? caches.delete(n) : undefined))
         ).then(() => self.clients.claim())
+    );
+});
+
+self.addEventListener('notificationclick', (event) => {
+    event.notification.close();
+    event.waitUntil(
+        self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+            if (clients.length > 0) {
+                return clients[0].focus();
+            }
+            return self.clients.openWindow('./');
+        })
     );
 });
 

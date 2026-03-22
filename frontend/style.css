@@ -34,6 +34,9 @@ body {
 
 .setup h1 { color: #7c4dff; font-size: 1.6em; }
 .setup .subtitle { color: #888; font-size: 0.85em; text-align: center; }
+.setup .version-link { color: #555; font-size: 0.75em; margin-top: 4px; text-align: center; }
+.setup .version-link a { color: #888; text-decoration: none; }
+.setup .version-link a:hover { text-decoration: underline; }
 
 .setup input, .setup button {
     width: 100%;

@@ -142,9 +142,7 @@ createApp({
         // Servers are independent relays — a message is routed through whichever
         // server the recipient is connected to.
         const DEFAULT_SERVERS = [
-            { name: 'Mango', url: 'ws://0.0.0.0:8080/ws' },
-            { name: 'Papaya', url: 'ws://0.0.0.0:8081/ws' },
-            { name: 'Guava', url: 'ws://0.0.0.0:8082/ws' },
+            { name: 'Local', url: 'wss://relay.e2hat.com/ws' },
         ];
         const savedServers = JSON.parse(localStorage.getItem('e2hat_servers') || 'null');
         const initialServers = savedServers !== null ? savedServers : DEFAULT_SERVERS;
@@ -328,9 +326,11 @@ createApp({
                 try {
                     const dk = deriveKeyFromPassword(savePassword.value);
                     derivedKeyCache = dk;
+                    const checkHash = (dk % 0xFFFFFFFFn).toString(16);
                     localStorage.setItem('e2hat_encrypted_keys', JSON.stringify({
                         dh: encryptKey(dhPrivateKey.value, dk),
                         mo: encryptKey(moPrivateKey.value, dk),
+                        check: checkHash,
                     }));
                     localStorage.setItem('e2hat_nickname', nickname.value);
                     keysSaved.value = true;
@@ -348,6 +348,12 @@ createApp({
                 try {
                     const data = JSON.parse(localStorage.getItem('e2hat_encrypted_keys'));
                     const dk = deriveKeyFromPassword(restorePassword.value);
+                    // Verify password
+                    const checkHash = (dk % 0xFFFFFFFFn).toString(16);
+                    if (data.check && data.check !== checkHash) {
+                        status.value = 'Wrong password';
+                        return;
+                    }
                     const dhKey = decryptKey(data.dh, dk);
                     const moKey = decryptKey(data.mo, dk);
                     const dh = new DiffieHellman(dhKey, CURVE_NAME);
@@ -379,6 +385,90 @@ createApp({
             status.value = '';
         }
 
+        // --- Export / Import private keys ---
+        function exportKeys() {
+            if (!dhPrivateKey.value || !moPrivateKey.value) return;
+            const data = JSON.stringify({
+                dh: dhPrivateKey.value.toString(16),
+                mo: moPrivateKey.value.toString(16),
+                nickname: nickname.value,
+            });
+            const blob = new Blob([data], { type: 'application/json' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'e2hat-keys.json';
+            a.click();
+            URL.revokeObjectURL(a.href);
+            log('Keys exported');
+        }
+
+        const importFileInput = ref(null);
+
+        function triggerImport() {
+            if (importFileInput.value) importFileInput.value.click();
+        }
+
+        function importKeys(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                try {
+                    const data = JSON.parse(reader.result);
+                    const dhKey = BigInt('0x' + data.dh);
+                    const moKey = BigInt('0x' + data.mo);
+                    const dh = new DiffieHellman(dhKey, CURVE_NAME);
+                    dhPrivateKey.value = dhKey;
+                    dhPublicKey.value = dh.publicKey;
+                    moPrivateKey.value = moKey;
+                    moInstance.value = new MasseyOmura(moKey, CURVE_NAME);
+                    const [x, parity] = dhPublicKey.value.compress();
+                    myPubKeyHex.value = pointToHex(x, parity);
+                    if (data.nickname) nickname.value = data.nickname;
+                    restoredKeys.value = true;
+                    status.value = 'Keys imported!';
+                    log('Keys imported from file');
+                } catch {
+                    status.value = 'Invalid key file';
+                }
+            };
+            reader.readAsText(file);
+            event.target.value = '';
+        }
+
+        // --- Notifications via Service Worker ---
+        async function notifyNewMessage(senderName, text) {
+            if (document.visibilityState === 'visible') return;
+            if (Notification.permission !== 'granted') return;
+            const body = text.length > 80 ? text.substring(0, 80) + '...' : text;
+            try {
+                const reg = await navigator.serviceWorker.ready;
+                await reg.showNotification(senderName, { body, icon: './icon.svg', tag: 'e2hat-msg-' + Date.now(), renotify: true });
+            } catch {
+                try { new Notification(senderName, { body, icon: './icon.svg' }); } catch {}
+            }
+            if (navigator.setAppBadge) navigator.setAppBadge().catch(() => {});
+        }
+
+        function clearBadge() {
+            if (navigator.clearAppBadge) navigator.clearAppBadge().catch(() => {});
+        }
+
+        // Reconnect servers when app comes back to foreground
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') {
+                clearBadge();
+                if (screen.value === 'chat') {
+                    servers.forEach((srv, i) => {
+                        if (srv.state === 'disconnected' && !srv._manualDisconnect) {
+                            srv._retries = 0;
+                            connectServer(i);
+                        }
+                    });
+                }
+            }
+        });
+
         // --- Enter chat (no auto-connect, user manages servers) ---
         function enterChat() {
             if (!nickname.value.trim() || !dhPublicKey.value) return;
@@ -386,17 +476,57 @@ createApp({
             screen.value = 'chat';
             view.value = servers.length ? 'contacts' : 'servers';
             log('Entered chat');
+            // Request notification permission
+            if ('Notification' in window && Notification.permission === 'default') {
+                Notification.requestPermission();
+            }
             // Auto-connect saved servers
             servers.forEach((_, i) => connectServer(i));
         }
 
         // === SERVER CONNECTION ===
+        // Use a Web Worker for timers so they fire even when the tab is in background.
+        const reconnectTimers = {};
+        const timerWorkerBlob = new Blob([`
+            const timers = {};
+            self.onmessage = (e) => {
+                const { action, id, delay } = e.data;
+                if (action === 'start') {
+                    clearTimeout(timers[id]);
+                    timers[id] = setTimeout(() => { self.postMessage({ id }); delete timers[id]; }, delay);
+                } else if (action === 'cancel') {
+                    clearTimeout(timers[id]); delete timers[id];
+                }
+            };
+        `], { type: 'application/javascript' });
+        const timerWorker = new Worker(URL.createObjectURL(timerWorkerBlob));
+        timerWorker.onmessage = (e) => {
+            const index = e.data.id;
+            delete reconnectTimers[index];
+            const srv = servers[index];
+            if (srv && screen.value === 'chat' && srv.state === 'disconnected' && !srv._manualDisconnect) {
+                connectServer(index);
+            }
+        };
+
+        function scheduleReconnect(index) {
+            if (reconnectTimers[index]) return;
+            const srv = servers[index];
+            if (srv._manualDisconnect) return;
+            const delay = Math.min(30000, 2000 * Math.pow(2, srv._retries || 0));
+            srv._retries = (srv._retries || 0) + 1;
+            log(`[${srv.name}] Reconnecting in ${Math.round(delay / 1000)}s...`);
+            reconnectTimers[index] = true;
+            timerWorker.postMessage({ action: 'start', id: index, delay });
+        }
+
         function connectServer(index) {
             const srv = servers[index];
             if (!srv || srv.state === 'connected' || srv.state === 'connecting') return;
             if (!dhPublicKey.value) return;
 
             srv.state = 'connecting';
+            srv._manualDisconnect = false;
             log(`[${srv.name}] Connecting to ${srv.url}...`);
 
             try {
@@ -405,11 +535,10 @@ createApp({
                 srv.ws = ws;
 
                 ws.onopen = () => {
+                    srv._retries = 0;
                     log(`[${srv.name}] Connected`);
-                    // Generate a fresh MO key per server connection
                     const moKey = randomMoKey();
                     srv.mo = new MasseyOmura(moKey, CURVE_NAME);
-                    // Send HELLO
                     const [x, parity] = dhPublicKey.value.compress();
                     ws.send(P.packHello(x, parity));
                     log(`[${srv.name}] >> HELLO`);
@@ -424,6 +553,7 @@ createApp({
                     srv.state = 'disconnected';
                     srv.ws = null;
                     srv.onlinePeers.clear();
+                    scheduleReconnect(index);
                 };
 
                 ws.onerror = () => {
@@ -433,11 +563,14 @@ createApp({
             } catch (e) {
                 log(`[${srv.name}] Failed: ${e.message}`);
                 srv.state = 'disconnected';
+                scheduleReconnect(index);
             }
         }
 
         function disconnectServer(index) {
             const srv = servers[index];
+            srv._manualDisconnect = true;
+            if (reconnectTimers[index]) { timerWorker.postMessage({ action: 'cancel', id: index }); delete reconnectTimers[index]; }
             if (srv.ws) { srv.ws.close(); srv.ws = null; }
             srv.state = 'disconnected';
             srv.onlinePeers.clear();
@@ -571,7 +704,9 @@ createApp({
 
             delete pendingRecvSessions[sessionId];
             const c = contacts.find(c => c.keyHex === session.senderHex);
-            log(`[${srv.name}] Message from ${c ? c.nickname : '?'}: "${text.substring(0, 40)}..."`);
+            const senderName = c ? c.nickname : '?';
+            log(`[${srv.name}] Message from ${senderName}: "${text.substring(0, 40)}..."`);
+            notifyNewMessage(senderName, text);
             scrollMessages();
         }
 
@@ -628,7 +763,7 @@ createApp({
             let url = newServerUrl.value.trim();
             if (!name || !url) return;
             if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
-                url = 'ws://' + url;
+                url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + url;
             }
             if (!url.endsWith('/ws')) {
                 url = url.replace(/\/$/, '') + '/ws';
@@ -735,6 +870,7 @@ createApp({
             startEditContact, finishEditContact,
             isOnline, unreadCount, startLogResize,
             copyPubKey, saveKeys, restoreKeys, clearSavedKeys,
+            exportKeys, importKeys, triggerImport, importFileInput,
         };
     },
 }).mount('#app');
