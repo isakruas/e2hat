@@ -901,17 +901,26 @@ createApp({
         }
 
         // === SEND MESSAGE ===
-        function sendMessage() {
-            if (!messageInput.value.trim() || !activeContact.value) return;
-            const text = messageInput.value.trim();
-            const destHex = activeContact.value.keyHex;
+        const KOBLITZ_MAX = 55;
 
-            const srvIdx = findServerForPeer(destHex);
-            if (srvIdx < 0) { log('No connected server available'); return; }
+        /** Split text into chunks <= KOBLITZ_MAX, breaking at spaces when possible. */
+        function splitText(text) {
+            const parts = [];
+            let remaining = text;
+            while (remaining.length > KOBLITZ_MAX) {
+                let cut = remaining.lastIndexOf(' ', KOBLITZ_MAX);
+                if (cut <= 0) cut = KOBLITZ_MAX; // no space found, hard cut
+                parts.push(remaining.substring(0, cut));
+                remaining = remaining.substring(cut).trimStart();
+            }
+            if (remaining.length) parts.push(remaining);
+            return parts;
+        }
+
+        function sendChunk(chunkText, destHex, srvIdx) {
             const srv = servers[srvIdx];
-
-            const [mPoint, j] = koblitz.encode(text);
-            log(`Koblitz encode: "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}" → point (j=${j})`);
+            const [mPoint, j] = koblitz.encode(chunkText);
+            log(`Koblitz encode: "${chunkText.substring(0, 30)}${chunkText.length > 30 ? '...' : ''}" → point (j=${j})`);
             const destPt = hexToPoint(destHex);
             const destPubKey = Point.decompress(destPt.x, destPt.parity, curve);
             const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
@@ -922,19 +931,35 @@ createApp({
             const c1Point = srv.mo.encrypt(ePoint);
             log(`MO encrypt: C1 = mo.encrypt(E) (C1.x: ${c1Point.x.toString(16).substring(0, 16)}...)`);
             const [c1X, c1Parity] = c1Point.compress();
-
             const [eX, eParity] = ePoint.compress();
 
             if (!messages[destHex]) messages[destHex] = [];
             const msgIndex = messages[destHex].length;
-            messages[destHex].push({ text, sent: true, time: new Date().toLocaleTimeString(), ts: Date.now(), status: 'sending', e_x: eX.toString(16), e_parity: Number(eParity), j });
+            messages[destHex].push({ text: chunkText, sent: true, time: new Date().toLocaleTimeString(), ts: Date.now(), status: 'sending', e_x: eX.toString(16), e_parity: Number(eParity), j });
             saveMessages(destHex);
 
             if (!pendingSendQueues[srvIdx]) pendingSendQueues[srvIdx] = [];
             pendingSendQueues[srvIdx].push({ moInstance: srv.mo, destHex, j, msgIndex, srvIdx });
 
-            log(`[${srv.name}] >> MO_SEND_INIT to ${activeContact.value.nickname} (j=${j}, ${text.length} chars)`);
+            log(`[${srv.name}] >> MO_SEND_INIT to ${activeContact.value.nickname} (j=${j}, ${chunkText.length} chars)`);
             srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, j, c1X, c1Parity));
+        }
+
+        function sendMessage() {
+            if (!messageInput.value.trim() || !activeContact.value) return;
+            const text = messageInput.value.trim();
+            const destHex = activeContact.value.keyHex;
+
+            const srvIdx = findServerForPeer(destHex);
+            if (srvIdx < 0) { log('No connected server available'); return; }
+
+            if (text.length <= KOBLITZ_MAX) {
+                sendChunk(text, destHex, srvIdx);
+            } else {
+                const parts = splitText(text);
+                log(`Message too long (${text.length} chars), splitting into ${parts.length} parts`);
+                for (const part of parts) sendChunk(part, destHex, srvIdx);
+            }
 
             messageInput.value = '';
             scrollMessages();
