@@ -18,6 +18,20 @@
  *
  * Multi-server: the frontend connects to multiple relay servers simultaneously.
  * Each server has its own MO key pair and WebSocket connection.
+ *
+ * Ephemeral key exchange (forward secrecy):
+ *   When both peers are online, they negotiate ephemeral DH key pairs via
+ *   in-band messages (marker \x02) sent through the existing MO 3-pass flow.
+ *   Transit encryption uses the ephemeral shared secret; at-rest storage always
+ *   re-encrypts under the permanent identity DH shared secret so messages
+ *   survive key rotation on reload. The server sees no difference — key exchange
+ *   messages are indistinguishable from regular encrypted traffic.
+ *
+ * Storage model:
+ *   Messages are stored in IndexedDB as encrypted curve points (e_x, e_parity, j),
+ *   never as plaintext. On load, text is re-derived: M = E * scalar⁻¹, then
+ *   Koblitz.decode(M, j). Identity keys (DH, MO) and ephemeral private keys are
+ *   stored encrypted with AES-GCM derived from the user's password (PBKDF2).
  */
 
 const { createApp, ref, reactive, computed, nextTick, watch } = Vue;
@@ -53,6 +67,7 @@ function randomPrivateKey() {
     }
 }
 
+/** Greatest common divisor (Euclidean algorithm). Used to ensure MO keys are coprime with n. */
 function gcd(a, b) {
     a = a < 0n ? -a : a;
     b = b < 0n ? -b : b;
@@ -79,9 +94,8 @@ function hexToPoint(hex) {
     return { x: BigInt('0x' + parts[0]), parity: BigInt(parts[1]) };
 }
 
-/** Modular inverse via extended Euclidean algorithm. */
+/** Modular inverse via Fermat's little theorem: a⁻¹ = a^(m-2) mod m (m must be prime). */
 function modInverse(a, m) {
-    // Fermat's little theorem: a^(-1) = a^(m-2) mod m (for prime m)
     a = ((a % m) + m) % m;
     let result = 1n;
     let base = a;
@@ -107,7 +121,7 @@ async function deriveScalar(sharedX, timestampMs, destHex, j) {
     const info = new TextEncoder().encode(`e2hat:${timestampMs}:${destHex}:${j}`);
     const derived = await crypto.subtle.deriveBits(
         { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(66), info },
-        hkdfKey, 528 // derive 528 bits, then reduce mod n
+        hkdfKey, 592 // derive 592 bits (521 + 71), then reduce mod n — bias < 2^-71 per FIPS 186-4
     );
     const raw = BigInt('0x' + bytesToHex(new Uint8Array(derived)));
     return (raw % (curve.n - 1n)) + 1n; // ensure [1, n-1]
@@ -276,14 +290,20 @@ createApp({
         const showAddContact = ref(false);
         const showAddServer = ref(false);
 
+        // --- MO session tracking ---
+        // pendingSendSessions: sessionId -> {moInstance, destHex, j, msgIndex, srvIdx, _resolve}
+        // pendingSendQueues: srvIdx -> FIFO of sessions awaiting server-assigned session ID
+        // pendingRecvSessions: sessionId -> {serverIndex, moInstance, senderHex, j, sigR, sigS, timestampMs}
+        // sentMessageMap: sessionId -> {destHex, msgIndex, ts} for tracking delivery status
         const pendingSendSessions = reactive({});
-        const pendingSendQueues = {};  // srvIdx -> FIFO of sessions awaiting server-assigned ID
+        const pendingSendQueues = {};
         const pendingRecvSessions = reactive({});
         const sentMessageMap = reactive({});
         const retryQueues = {};
-        const seenSignatures = new Map(); // Anti-replay: fingerprint → timestamp
-        const REPLAY_MAX_AGE = 5 * 60 * 1000; // 5 minutes
+        const seenSignatures = new Map(); // Anti-replay: sig fingerprint → timestamp
+        const REPLAY_MAX_AGE = 5 * 60 * 1000; // 5 min window for replay detection
         let _replayPersistTimer = null;
+        /** Debounced persistence of replay guard to IndexedDB (1s delay to batch writes). */
         function persistReplayGuard() {
             if (_replayPersistTimer) return;
             _replayPersistTimer = setTimeout(async () => {
@@ -299,7 +319,22 @@ createApp({
             idbPut('replayGuard', 'signatures', obj);
         }
         window.addEventListener('beforeunload', flushReplayGuardNow);
-        const pendingMultiparts = {};  // senderHex:groupId -> { total, parts: {idx: text}, ... }
+        // pendingMultiparts: "senderHex:groupId" -> {total, parts: {idx: text}, senderHex, msgIndex, ...}
+        const pendingMultiparts = {};
+
+        // --- Ephemeral DH key state ---
+        // ephemeralKeys[contactHex] = {
+        //   myPriv: BigInt,           — my ephemeral private key
+        //   myPubX: BigInt,           — my ephemeral public key X coordinate
+        //   myPubParity: BigInt,      — my ephemeral public key parity (0 or 1)
+        //   peerPubX: BigInt|null,    — peer's ephemeral public key X (null until received)
+        //   peerPubParity: BigInt|null,
+        //   state: 'initiated'|'complete',
+        //   negotiatedAt: number,     — Date.now() when exchange completed
+        //   generation: number,       — monotonic counter for rekey cycles
+        // }
+        const ephemeralKeys = reactive({});
+        let _ephemeralAesKey = null; // cached AES-GCM key (derived from user password) for encrypting ephemeral privkeys in IDB
 
         const koblitz = new Koblitz(CURVE_NAME);
         const messagesEl = ref(null);
@@ -443,12 +478,16 @@ createApp({
 
         // --- Persistence (IndexedDB) ---
 
+        /** Strip volatile/runtime fields before persisting a message to IndexedDB.
+         *  If the message has e_x (encrypted curve point), also strip the plaintext —
+         *  it will be re-derived from e_x on reload via identity DH + HKDF. */
         function cleanMsgForStorage(m) {
-            if (m.e_x) { const { text, _blobUrl, _receiving, _multipartDone, ...rest } = m; return rest; }
+            if (m.e_x) { const { text: _text, _blobUrl, _receiving, _multipartDone, ...rest } = m; return rest; }
             const { _blobUrl, _receiving, _multipartDone, ...rest } = m;
             return rest;
         }
 
+        /** Persist messages to IndexedDB. If contactHex given, saves only that conversation. */
         function saveMessages(contactHex) {
             if (contactHex) {
                 const list = (messages[contactHex] || []).map(cleanMsgForStorage);
@@ -463,11 +502,15 @@ createApp({
 
         const MSG_TTL = 365 * 24 * 60 * 60 * 1000; // 1 year in ms
 
+        /** Reload messages from IndexedDB, re-deriving plaintext from stored curve points.
+         *  Each stored message has e_x (encrypted point E), e_parity, j, and sigTs/ts.
+         *  Decryption: scalar = HKDF(identityDH.x, ts, dest, j), M = E * scalar⁻¹, text = Koblitz.decode(M, j).
+         *  e_x is always encrypted with identity keys (not ephemeral), so this survives rekey cycles. */
         async function loadMessages() {
             const keys = await idbGetAllKeys('messages');
             if (!keys.length) return;
             const now = Date.now();
-            const invCache = {};
+            const invCache = {}; // contactHex -> identity DH shared secret X (cached across messages)
             let totalLoaded = 0;
             let totalExpired = 0;
             const BATCH_SIZE = 5; // decrypt N messages per tick to avoid CPU spike
@@ -498,6 +541,7 @@ createApp({
                         result[i] = { ...m, text: '[unreadable]' };
                     } else {
                         try {
+                            // e_x is always stored encrypted with identity keys (survives ephemeral rekey)
                             if (!invCache[contactHex]) {
                                 const pt = hexToPoint(contactHex);
                                 const pubKey = Point.decompress(pt.x, pt.parity, curve);
@@ -557,12 +601,14 @@ createApp({
             }, 50);
         }
 
+        /** Encrypt identity keys (DH + MO) with user password via PBKDF2 → AES-GCM, save to IndexedDB. */
         function saveKeys() {
             if (!savePassword.value.trim() || !dhPrivateKey.value || !moPrivateKey.value) return;
             status.value = 'Encrypting keys...';
             setTimeout(async () => {
                 try {
                     const { aesKey, salt } = await deriveAesKey(savePassword.value);
+                    _ephemeralAesKey = aesKey;
                     const dhEnc = await aesGcmEncrypt(aesKey, bigintToFixedBytes(dhPrivateKey.value));
                     const moEnc = await aesGcmEncrypt(aesKey, bigintToFixedBytes(moPrivateKey.value));
                     await idbPut('keys', 'encrypted', {
@@ -579,6 +625,7 @@ createApp({
             }, 50);
         }
 
+        /** Decrypt identity keys from IndexedDB using user password, then load ephemeral keys and messages. */
         function restoreKeys() {
             if (!restorePassword.value.trim()) return;
             status.value = 'Decrypting keys...';
@@ -587,6 +634,7 @@ createApp({
                     const data = await idbGet('keys', 'encrypted');
                     if (!data) { status.value = 'No saved keys'; return; }
                     const { aesKey } = await deriveAesKey(restorePassword.value, data.salt);
+                    _ephemeralAesKey = aesKey;
                     const dhBytes = await aesGcmDecrypt(aesKey, data.dh_iv, data.dh_ct);
                     const moBytes = await aesGcmDecrypt(aesKey, data.mo_iv, data.mo_ct);
                     const dhKey = fixedBytesToBigint(dhBytes);
@@ -595,9 +643,10 @@ createApp({
                     dhPrivateKey.value = dhKey;
                     dhPublicKey.value = dh.publicKey;
                     moPrivateKey.value = moKey;
-    
+
                     const [x, parity] = dhPublicKey.value.compress();
                     myPubKeyHex.value = pointToHex(x, parity);
+                    await loadEphemeralKeys(aesKey);
                     await loadMessages();
                     const savedNick = await idbGet('config', 'nickname');
                     if (savedNick) nickname.value = savedNick;
@@ -717,10 +766,24 @@ createApp({
             }
             // Auto-connect saved servers
             servers.forEach((_, i) => connectServer(i));
+            // Periodic ephemeral key renegotiation: every 60s, check all online contacts
+            // and re-initiate if their last negotiation exceeded REKEY_INTERVAL_MS.
+            setInterval(() => {
+                for (const c of contacts) {
+                    if (!isOnline(c.keyHex)) continue;
+                    const ek = ephemeralKeys[c.keyHex];
+                    if (!ek || ek.state !== 'complete') continue;
+                    if (Date.now() - ek.negotiatedAt > REKEY_INTERVAL_MS) {
+                        const idx = findServerForPeer(c.keyHex);
+                        if (idx >= 0) initiateEphemeralExchange(c.keyHex, idx);
+                    }
+                }
+            }, 60000);
         }
 
         // === SERVER CONNECTION ===
-        // Use a Web Worker for timers so they fire even when the tab is in background.
+        // Reconnection uses a Web Worker for timers so they fire even when the tab is backgrounded.
+        // Exponential backoff: 2s, 4s, 8s, 16s, 30s (capped).
         const reconnectTimers = {};
         const timerWorkerBlob = new Blob([`
             const timers = {};
@@ -755,6 +818,7 @@ createApp({
             timerWorker.postMessage({ action: 'start', id: index, delay });
         }
 
+        /** Open WebSocket to relay server, send HELLO with our DH public key, handle MO protocol. */
         function connectServer(index) {
             const srv = servers[index];
             if (!srv || srv.state === 'connected' || srv.state === 'connecting') return;
@@ -814,7 +878,7 @@ createApp({
             log(`[${srv.name}] Manually disconnected`);
         }
 
-        // === PROTOCOL HANDLER (per server) ===
+        /** Main protocol dispatcher — routes incoming binary frames to the appropriate handler. */
         async function handleServerMessage(srvIdx, data) {
             const srv = servers[srvIdx];
             if (!srv) return;
@@ -884,6 +948,9 @@ createApp({
                     srv.onlinePeers.add(hex);
                     const c = contacts.find(c => c.keyHex === hex);
                     log(`[${srv.name}] Peer online: ${c ? c.nickname : hex.substring(0, 16) + '...'} (${srv.onlinePeers.size} peers)`);
+                    if (c) {
+                        initiateEphemeralExchange(hex, srvIdx);
+                    }
                     break;
                 }
                 case P.PEER_OFFLINE: {
@@ -1001,6 +1068,18 @@ createApp({
             if (missingParts > 0) {
                 log(`Multipart assembly: ${missingParts} missing parts out of ${mp.total}`);
             }
+
+            // Check for ephemeral key exchange after reassembly
+            if (fullText.charAt(0) === EPHEMERAL_MARKER) {
+                handleEphemeralMessage(fullText, mp.senderHex);
+                // Remove placeholder from UI
+                if (messages[mp.senderHex] && mp.msgIndex !== undefined) {
+                    messages[mp.senderHex].splice(mp.msgIndex, 1);
+                }
+                delete pendingMultiparts[key];
+                return;
+            }
+
             // Validate base64 integrity for data URIs
             if (fullText.startsWith('data:') && fullText.includes(';base64,')) {
                 const b64 = fullText.substring(fullText.indexOf(',') + 1);
@@ -1054,7 +1133,7 @@ createApp({
             const c3Point = Point.decompress(x, parity, curve);
             const ePoint = session.moInstance.decrypt(c3Point);
             log(`[${srv.name}] MO decrypt: E = mo.decrypt(C3') (E.x: ${ePoint.x.toString(16).substring(0, 16)}...)`);
-            const [recvEX, recvEParity] = ePoint.compress();
+            const [_recvEX, recvEParity] = ePoint.compress();
 
             // Verify ECDSA signature on E.x:eParity:j:timestamp:dest (hashed internally by verifyMessage)
             let verified = false;
@@ -1105,17 +1184,50 @@ createApp({
                 return;
             }
 
-            const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
-            const shared = dh.computeSharedSecret(senderPubKey);
-            const scalar = await deriveScalar(shared.x, session.timestampMs, myPubKeyHex.value, session.j);
-            log(`[${srv.name}] DH + HKDF(ts:dest:j) → scalar (${scalar.toString(16).substring(0, 16)}...)`);
-            const invScalar = modInverse(scalar, curve.n);
-            const mPoint = ePoint.mul(invScalar);
-            log(`[${srv.name}] DH decrypt: M = E * scalar⁻¹ (M.x: ${mPoint.x.toString(16).substring(0, 16)}...)`);
-            const paddedText = koblitz.decode(mPoint, session.j);
-            // Strip the 4-char nonce prefix
-            const text = paddedText.length > NONCE_LEN ? paddedText.substring(NONCE_LEN) : paddedText;
-            log(`[${srv.name}] Koblitz decode: stripped nonce → "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}" (j=${session.j})`);
+            // Decrypt: try ephemeral keys first (if negotiated), fallback to identity keys.
+            // The sender may have used either set depending on their ephemeral state.
+            let text, decryptedMPoint;
+            const keySets = [getActiveKeys(session.senderHex)];
+            if (ephemeralKeys[session.senderHex]?.state === 'complete') {
+                keySets.push({ myPriv: dhPrivateKey.value, peerPub: senderPubKey });
+            }
+            for (const { myPriv, peerPub } of keySets) {
+                try {
+                    const dh = new DiffieHellman(myPriv, CURVE_NAME);
+                    const shared = dh.computeSharedSecret(peerPub);
+                    const scalar = await deriveScalar(shared.x, session.timestampMs, myPubKeyHex.value, session.j);
+                    const invScalar = modInverse(scalar, curve.n);
+                    const mPoint = ePoint.mul(invScalar);
+                    const paddedText = koblitz.decode(mPoint, session.j);
+                    text = paddedText.length > NONCE_LEN ? paddedText.substring(NONCE_LEN) : paddedText;
+                    decryptedMPoint = mPoint;
+                    log(`[${srv.name}] DH + HKDF(ts:dest:j) → scalar (${scalar.toString(16).substring(0, 16)}...)`);
+                    log(`[${srv.name}] DH decrypt: M = E * scalar⁻¹ (M.x: ${mPoint.x.toString(16).substring(0, 16)}...)`);
+                    log(`[${srv.name}] Koblitz decode: stripped nonce → "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}" (j=${session.j})`);
+                    break;
+                } catch (_e) { continue; }
+            }
+            if (!text) {
+                log(`[${srv.name}] Decryption failed with all keys`);
+                delete pendingRecvSessions[sessionId];
+                return;
+            }
+
+            // Re-encrypt M with identity keys for at-rest storage.
+            // Transit may use ephemeral keys, but stored e_x must always be identity-encrypted
+            // so loadMessages() can re-derive text after any number of rekey cycles.
+            const identDh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
+            const identShared = identDh.computeSharedSecret(senderPubKey);
+            const storageScalar = await deriveScalar(identShared.x, session.timestampMs, myPubKeyHex.value, session.j);
+            const storageE = decryptedMPoint.mul(storageScalar);
+            const [storageEX, storageEParity] = storageE.compress();
+
+            // Check for ephemeral key exchange message
+            if (text.charAt(0) === EPHEMERAL_MARKER) {
+                await handleEphemeralMessage(text, session.senderHex);
+                delete pendingRecvSessions[sessionId];
+                return;
+            }
 
             // Check for multipart header: \x01 + 8-char groupId + 3-char partIdx(padded base36) + 3-char total(padded base36)
             if (text.length >= MULTIPART_HEADER_LEN && text.charAt(0) === MULTIPART_MARKER) {
@@ -1176,7 +1288,7 @@ createApp({
                 text, sent: false, time: new Date().toLocaleTimeString(), ts: Date.now(),
                 sigTs: session.timestampMs, // original sender timestamp for HKDF re-derivation
                 verified, nonce: true,
-                e_x: recvEX.toString(16), e_parity: Number(recvEParity), j: session.j,
+                e_x: storageEX.toString(16), e_parity: Number(storageEParity), j: session.j,
             });
             saveMessages(session.senderHex);
 
@@ -1191,8 +1303,9 @@ createApp({
             scrollMessages();
         }
 
-        const SENT_MAP_TTL = 365 * 24 * 60 * 60 * 1000; // 1 year in ms
+        const SENT_MAP_TTL = 365 * 24 * 60 * 60 * 1000; // 1 year
 
+        /** Remove stale entries from sentMessageMap to prevent unbounded memory growth. */
         function cleanSentMessageMap() {
             const now = Date.now();
             for (const sid of Object.keys(sentMessageMap)) {
@@ -1203,6 +1316,7 @@ createApp({
             }
         }
 
+        /** Update message delivery status (sent/delivered/queued) from server acknowledgement. */
         function handleMsgStatus(payload, newStatus) {
             const sid = P.unpackSessionId(payload);
             const info = sentMessageMap[sid];
@@ -1229,23 +1343,253 @@ createApp({
         }
 
         // === SEND MESSAGE ===
+        //
+        // Text is Koblitz-encoded into a curve point. secp521r1 supports ~55 chars per point,
+        // minus 4-char nonce prefix = 51 usable chars per chunk (KOBLITZ_MAX).
+        // Messages > 51 chars are split into multipart chunks with a 15-byte header:
+        //   \x01 + groupId(8) + partIdx(3, base36) + total(3, base36) + payload(36 chars max)
+        //
         const NONCE_LEN = 4;
-        const KOBLITZ_MAX = 51; // secp521r1 Koblitz limit (55) minus nonce prefix
+        const KOBLITZ_MAX = 51;
         const MULTIPART_MARKER = '\x01';
-        const MULTIPART_HEADER_LEN = 15; // \x01 + 8-char groupId + 3-char partIdx(base36) + 3-char total(base36)
-        const MULTIPART_KOBLITZ_MAX = KOBLITZ_MAX - MULTIPART_HEADER_LEN; // 36
+        const MULTIPART_HEADER_LEN = 15;
+        const MULTIPART_KOBLITZ_MAX = KOBLITZ_MAX - MULTIPART_HEADER_LEN; // 36 chars per chunk
         const MAX_MULTIPART_PARTS = 46656; // 36^3
-        const MAX_MESSAGE_LENGTH = 36 * MULTIPART_KOBLITZ_MAX; // text input cap (1512)
-        const MAX_MEDIA_LENGTH = MAX_MULTIPART_PARTS * MULTIPART_KOBLITZ_MAX; // 1959552
+        const MAX_MESSAGE_LENGTH = 36 * MULTIPART_KOBLITZ_MAX; // 1296 chars for text input
+        const MAX_MEDIA_LENGTH = MAX_MULTIPART_PARTS * MULTIPART_KOBLITZ_MAX; // ~1.9M chars for media
         const maxMessageLength = ref(MAX_MESSAGE_LENGTH);
 
-        // Send semaphore — ensures only one chunk is in-flight at a time
+        // --- Ephemeral DH key exchange (forward secrecy) ---
+        //
+        // Protocol: in-band key exchange via \x02 marker over existing MO 3-pass.
+        // Payload format: \x02 + type('I'|'R') + pubX_hex(132 chars padded) + ':' + parity(1 char)
+        // Total ~136 chars → sent as multipart (4 chunks of 36 chars).
+        //
+        // Flow:
+        //   1. PEER_ONLINE → initiator sends \x02I + ephemeral pub key
+        //   2. Responder receives, generates own ephemeral, sends \x02R + pub key
+        //   3. Both compute DH(myEphPriv, peerEphPub) → ephemeral shared secret
+        //   4. Subsequent messages use ephemeral keys for transit encryption
+        //
+        // Key exchange messages are encrypted with identity keys (ephemeral doesn't exist yet).
+        // Tiebreaker for simultaneous initiation: lower keyHex is canonical initiator.
+        // Renegotiation: every REKEY_INTERVAL_MS when both peers are online.
+        //
+        const EPHEMERAL_MARKER = '\x02';
+        const EPHEMERAL_INITIATE = 'I';
+        const EPHEMERAL_RESPOND = 'R';
+        const REKEY_INTERVAL_MS = 30 * 60 * 1000; // 30 min
+
+        /** Return {myPriv, peerPub} for DH — ephemeral if negotiated, else identity keys. */
+        function getActiveKeys(contactHex) {
+            const ek = ephemeralKeys[contactHex];
+            if (ek && ek.state === 'complete' && ek.peerPubX && ek.myPriv) {
+                const peerPub = Point.decompress(ek.peerPubX, ek.peerPubParity, curve);
+                return { myPriv: ek.myPriv, peerPub };
+            }
+            const destPt = hexToPoint(contactHex);
+            return { myPriv: dhPrivateKey.value, peerPub: Point.decompress(destPt.x, destPt.parity, curve) };
+        }
+
+        /** Send a chunk silently (no UI message, no sentMessageMap tracking).
+         *  Always uses identity keys for DH — used exclusively for key exchange payloads. */
+        function sendInternalChunk(chunkText, destHex, srvIdx) {
+            return new Promise(async (resolve) => {
+                const srv = servers[srvIdx];
+                while (srv._rateLimited) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+                const nonce = generateNonce();
+                const paddedText = nonce + chunkText;
+                const [mPoint, j] = koblitz.encode(paddedText);
+                const destPt = hexToPoint(destHex);
+                const destPubKey = Point.decompress(destPt.x, destPt.parity, curve);
+                const timestampMs = Date.now();
+                // Always use identity keys for key exchange messages
+                const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
+                const shared = dh.computeSharedSecret(destPubKey);
+                const scalar = await deriveScalar(shared.x, timestampMs, destHex, j);
+                const ePoint = mPoint.mul(scalar);
+                const [_eX, eParity] = ePoint.compress();
+                const sigPayload = `${ePoint.x.toString(16)}:${eParity}:${j}:${timestampMs}:${destHex}`;
+                const signer = new DigitalSignature(dhPrivateKey.value, CURVE_NAME);
+                const [sigR, sigS] = await signer.signMessage(sigPayload);
+                const c1Point = srv.mo.encrypt(ePoint);
+                const [c1X, c1Parity] = c1Point.compress();
+                if (!pendingSendQueues[srvIdx]) pendingSendQueues[srvIdx] = [];
+                pendingSendQueues[srvIdx].push({ moInstance: srv.mo, destHex, j, msgIndex: -1, srvIdx, _resolve: resolve });
+                srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, j, c1X, c1Parity, sigR, sigS, timestampMs));
+            });
+        }
+
+        /** Send an ephemeral key exchange payload via multipart (silent, no UI).
+         *  Splits payload into multipart chunks if it exceeds KOBLITZ_MAX. */
+        async function sendEphemeralPayload(payload, destHex, srvIdx) {
+            if (payload.length <= KOBLITZ_MAX) {
+                await enqueueSend(() => sendInternalChunk(payload, destHex, srvIdx));
+            } else {
+                const groupId = generateGroupId();
+                const parts = splitMedia(payload, MULTIPART_KOBLITZ_MAX);
+                const total = parts.length;
+                for (let i = 0; i < total; i++) {
+                    const header = MULTIPART_MARKER + groupId + i.toString(36).padStart(3, '0') + total.toString(36).padStart(3, '0');
+                    await enqueueSend(() => sendInternalChunk(header + parts[i], destHex, srvIdx));
+                }
+            }
+        }
+
+        /** Initiate ephemeral key exchange with a contact.
+         *  Generates a new ephemeral key pair, sends \x02I + pub to the peer.
+         *  Skips if exchange is already in progress or completed within REKEY_INTERVAL_MS. */
+        async function initiateEphemeralExchange(contactHex, srvIdx) {
+            const ek = ephemeralKeys[contactHex];
+            if (ek && ek.state === 'initiated') return;
+            if (ek && ek.state === 'complete' && ek.negotiatedAt && Date.now() - ek.negotiatedAt < REKEY_INTERVAL_MS) return;
+
+            const priv = randomPrivateKey();
+            const dh = new DiffieHellman(priv, CURVE_NAME);
+            const [pubX, pubParity] = dh.publicKey.compress();
+            const gen = (ek && ek.generation) ? ek.generation + 1 : 1;
+
+            ephemeralKeys[contactHex] = {
+                myPriv: priv,
+                myPubX: pubX,
+                myPubParity: pubParity,
+                peerPubX: null,
+                peerPubParity: null,
+                state: 'initiated',
+                negotiatedAt: 0,
+                generation: gen,
+            };
+
+            const payload = EPHEMERAL_MARKER + EPHEMERAL_INITIATE + pubX.toString(16).padStart(132, '0') + ':' + pubParity.toString();
+            log(`Initiating ephemeral key exchange with ${contactHex.substring(0, 16)}... (gen ${gen})`);
+            await sendEphemeralPayload(payload, contactHex, srvIdx);
+            saveEphemeralKeys();
+        }
+
+        /** Handle an incoming ephemeral key exchange message (\x02I or \x02R).
+         *  On 'I' (initiate): store peer's pub, generate own ephemeral, respond with \x02R, state → complete.
+         *  On 'R' (respond): store peer's pub, state → complete. Both sides now share ephemeral DH secret. */
+        async function handleEphemeralMessage(text, senderHex) {
+            const type = text.charAt(1);
+            const body = text.substring(2);
+            const colonIdx = body.lastIndexOf(':');
+            if (colonIdx < 0) { log('Malformed ephemeral message'); return; }
+            const peerPubX = BigInt('0x' + body.substring(0, colonIdx));
+            const peerPubParity = BigInt(body.substring(colonIdx + 1));
+
+            if (type === EPHEMERAL_INITIATE) {
+                const ek = ephemeralKeys[senderHex];
+                // Tiebreaker for simultaneous initiation: lower keyHex is canonical initiator
+                if (ek && ek.state === 'initiated') {
+                    if (myPubKeyHex.value < senderHex) {
+                        log(`Ephemeral tiebreaker: I am canonical initiator, ignoring peer's initiate`);
+                        return;
+                    }
+                    // Peer wins — abandon my initiation, respond to theirs
+                }
+
+                const priv = randomPrivateKey();
+                const dh = new DiffieHellman(priv, CURVE_NAME);
+                const [pubX, pubParity] = dh.publicKey.compress();
+                const gen = (ek && ek.generation) ? ek.generation + 1 : 1;
+
+                ephemeralKeys[senderHex] = {
+                    myPriv: priv,
+                    myPubX: pubX,
+                    myPubParity: pubParity,
+                    peerPubX: peerPubX,
+                    peerPubParity: peerPubParity,
+                    state: 'complete',
+                    negotiatedAt: Date.now(),
+                    generation: gen,
+                };
+
+                const payload = EPHEMERAL_MARKER + EPHEMERAL_RESPOND + pubX.toString(16).padStart(132, '0') + ':' + pubParity.toString();
+                const srvIdx = findServerForPeer(senderHex);
+                if (srvIdx >= 0) {
+                    log(`Responding to ephemeral key exchange from ${senderHex.substring(0, 16)}... (gen ${gen})`);
+                    await sendEphemeralPayload(payload, senderHex, srvIdx);
+                }
+                saveEphemeralKeys();
+                log(`Ephemeral key exchange complete with ${senderHex.substring(0, 16)}... (gen ${gen})`);
+            } else if (type === EPHEMERAL_RESPOND) {
+                const ek = ephemeralKeys[senderHex];
+                if (!ek || ek.state !== 'initiated') {
+                    log(`Unexpected ephemeral response from ${senderHex.substring(0, 16)}...`);
+                    return;
+                }
+                ek.peerPubX = peerPubX;
+                ek.peerPubParity = peerPubParity;
+                ek.state = 'complete';
+                ek.negotiatedAt = Date.now();
+                saveEphemeralKeys();
+                log(`Ephemeral key exchange complete with ${senderHex.substring(0, 16)}... (gen ${ek.generation})`);
+            }
+        }
+
+        /** Persist ephemeral keys to IndexedDB.
+         *  Private keys are encrypted with AES-GCM (_ephemeralAesKey derived from user password).
+         *  Public keys and metadata are stored in plaintext (not secrets). */
+        async function saveEphemeralKeys() {
+            if (!_ephemeralAesKey) return;
+            try {
+                const data = {};
+                for (const [hex, ek] of Object.entries(ephemeralKeys)) {
+                    const privEnc = await aesGcmEncrypt(_ephemeralAesKey, bigintToFixedBytes(ek.myPriv));
+                    data[hex] = {
+                        myPriv_iv: privEnc.iv, myPriv_ct: privEnc.ciphertext,
+                        myPubX: ek.myPubX.toString(16),
+                        myPubParity: ek.myPubParity.toString(),
+                        peerPubX: ek.peerPubX ? ek.peerPubX.toString(16) : null,
+                        peerPubParity: ek.peerPubParity !== null && ek.peerPubParity !== undefined ? ek.peerPubParity.toString() : null,
+                        state: ek.state,
+                        negotiatedAt: ek.negotiatedAt,
+                        generation: ek.generation,
+                    };
+                }
+                await idbPut('keys', 'ephemeral', { contacts: data });
+            } catch (e) {
+                log('Failed to save ephemeral keys: ' + e.message);
+            }
+        }
+
+        /** Load and decrypt ephemeral keys from IndexedDB. Called during restoreKeys(). */
+        async function loadEphemeralKeys(aesKey) {
+            try {
+                const stored = await idbGet('keys', 'ephemeral');
+                if (!stored || !stored.contacts) return;
+                for (const [hex, d] of Object.entries(stored.contacts)) {
+                    const privBytes = await aesGcmDecrypt(aesKey, d.myPriv_iv, d.myPriv_ct);
+                    const myPriv = fixedBytesToBigint(privBytes);
+                    ephemeralKeys[hex] = {
+                        myPriv,
+                        myPubX: BigInt('0x' + d.myPubX),
+                        myPubParity: BigInt(d.myPubParity),
+                        peerPubX: d.peerPubX ? BigInt('0x' + d.peerPubX) : null,
+                        peerPubParity: d.peerPubParity !== null ? BigInt(d.peerPubParity) : null,
+                        state: d.state,
+                        negotiatedAt: d.negotiatedAt,
+                        generation: d.generation,
+                    };
+                }
+                const count = Object.keys(stored.contacts).length;
+                if (count) log(`Ephemeral keys restored for ${count} contact(s)`);
+            } catch (e) {
+                log('Failed to load ephemeral keys: ' + e.message);
+            }
+        }
+
+        // Send semaphore — ensures only one MO 3-pass is in-flight at a time.
+        // Without this, concurrent sends would interleave MO steps and corrupt sessions.
         let sendQueueTail = Promise.resolve();
         function enqueueSend(fn) {
             sendQueueTail = sendQueueTail.then(fn, fn);
             return sendQueueTail;
         }
 
+        /** Generate a random 8-char hex ID for multipart message grouping. */
         function generateGroupId() {
             const bytes = new Uint8Array(4);
             crypto.getRandomValues(bytes);
@@ -1276,6 +1620,11 @@ createApp({
             return parts;
         }
 
+        /** Encrypt and send a single text chunk via MO 3-pass.
+         *  Uses ephemeral DH keys for transit if negotiated, identity keys otherwise.
+         *  ECDSA signature always uses identity key (binds to permanent identity).
+         *  At-rest storage (e_x) is always re-encrypted with identity keys so it
+         *  survives ephemeral rekey cycles and can be re-derived on reload. */
         function sendChunk(chunkText, destHex, srvIdx, multipartMsgIndex) {
             return new Promise(async (resolve) => {
                 const srv = servers[srvIdx];
@@ -1295,10 +1644,11 @@ createApp({
                 }
                 log(`Koblitz encode: nonce="${nonce}" + "${chunkText.substring(0, 26)}${chunkText.length > 26 ? '...' : ''}" → point (j=${j})`);
                 const destPt = hexToPoint(destHex);
-                const destPubKey = Point.decompress(destPt.x, destPt.parity, curve);
                 const timestampMs = Date.now();
-                const dh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
-                const shared = dh.computeSharedSecret(destPubKey);
+                // Use ephemeral keys if negotiated, else identity keys
+                const { myPriv, peerPub } = getActiveKeys(destHex);
+                const dh = new DiffieHellman(myPriv, CURVE_NAME);
+                const shared = dh.computeSharedSecret(peerPub);
                 const scalar = await deriveScalar(shared.x, timestampMs, destHex, j);
                 log(`DH + HKDF(ts:dest:j) → scalar (${scalar.toString(16).substring(0, 16)}...)`);
                 const ePoint = mPoint.mul(scalar);
@@ -1313,6 +1663,17 @@ createApp({
                 const [sigR, sigS] = await signer.signMessage(sigPayload);
                 log(`ECDSA sign: sig(E.x:eParity:j:ts:dest) = (r: ${sigR.toString(16).substring(0, 12)}..., s: ${sigS.toString(16).substring(0, 12)}...)`);
 
+                // Re-encrypt M with identity keys for at-rest storage (survives ephemeral rekey)
+                let storageEX = eX, storageEParity = eParity;
+                if (myPriv !== dhPrivateKey.value) {
+                    const destPubKey = Point.decompress(destPt.x, destPt.parity, curve);
+                    const identDh = new DiffieHellman(dhPrivateKey.value, CURVE_NAME);
+                    const identShared = identDh.computeSharedSecret(destPubKey);
+                    const identScalar = await deriveScalar(identShared.x, timestampMs, destHex, j);
+                    const identE = mPoint.mul(identScalar);
+                    [storageEX, storageEParity] = identE.compress();
+                }
+
                 const c1Point = srv.mo.encrypt(ePoint);
                 log(`MO encrypt: C1 = mo.encrypt(E) (C1.x: ${c1Point.x.toString(16).substring(0, 16)}...)`);
                 const [c1X, c1Parity] = c1Point.compress();
@@ -1323,7 +1684,7 @@ createApp({
                 } else {
                     if (!messages[destHex]) messages[destHex] = [];
                     msgIndex = messages[destHex].length;
-                    messages[destHex].push({ text: chunkText, sent: true, time: new Date().toLocaleTimeString(), ts: timestampMs, status: 'sending', e_x: eX.toString(16), e_parity: Number(eParity), j, nonce: true });
+                    messages[destHex].push({ text: chunkText, sent: true, time: new Date().toLocaleTimeString(), ts: timestampMs, status: 'sending', e_x: storageEX.toString(16), e_parity: Number(storageEParity), j, nonce: true });
                     saveMessages(destHex);
                 }
 
@@ -1338,7 +1699,7 @@ createApp({
         // === MEDIA HELPERS ===
         const fileInput = ref(null);
 
-        function isMediaMessage(text) { return text && text.startsWith('data:'); }
+        function _isMediaMessage(text) { return text && text.startsWith('data:'); }
         function isImageMsg(text) { return text && text.startsWith('data:image/'); }
         function isAudioMsg(text) { return text && text.startsWith('data:audio/'); }
         function isVideoMsg(text) { return text && text.startsWith('data:video/'); }
@@ -1420,6 +1781,7 @@ createApp({
             });
         }
 
+        /** Send a media file (image/audio/video) as data URI via multipart chunks. */
         async function sendMediaMessage(dataUri, destHex, srvIdx) {
             const parts = splitMedia(dataUri, MULTIPART_KOBLITZ_MAX);
             if (parts.length > MAX_MULTIPART_PARTS) {
@@ -1504,7 +1866,7 @@ createApp({
                 try {
                     options = { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 8000 };
                     mediaRecorder = new MediaRecorder(stream, options);
-                } catch (e) {
+                } catch (_e) {
                     options = { mimeType: 'audio/webm', audioBitsPerSecond: 8000 };
                     mediaRecorder = new MediaRecorder(stream, options);
                 }
@@ -1540,6 +1902,7 @@ createApp({
             });
         }
 
+        /** Send a text message to the active contact. Splits into multipart if > KOBLITZ_MAX chars. */
         async function sendMessage() {
             if (!messageInput.value.trim() || !activeContact.value) return;
             const text = messageInput.value.trim();
@@ -1632,6 +1995,9 @@ createApp({
             // Purge all message history for this contact
             delete messages[c.keyHex];
             idbDel('messages', c.keyHex).catch(() => {});
+            // Clean up ephemeral keys for this contact
+            delete ephemeralKeys[c.keyHex];
+            saveEphemeralKeys();
             // Remove any pending multiparts from this contact
             for (const key of Object.keys(pendingMultiparts)) {
                 if (key.startsWith(c.keyHex + ':')) delete pendingMultiparts[key];
@@ -1659,6 +2025,7 @@ createApp({
             editingContact.value = null;
         }
 
+        /** Auto-add unknown senders to the contact list so messages are not lost. */
         function ensureContact(keyHex) {
             if (contacts.find(c => c.keyHex === keyHex)) return;
             const shortKey = keyHex.substring(0, 12) + '...';

@@ -111,7 +111,7 @@ function packAuth(r, s) {
     return packFrame(AUTH, payload);
 }
 
-function unpackAuth(payload) {
+function _unpackAuth(payload) {
     const r = bytesToBigint(payload, 0, COORD_SIZE);
     const s = bytesToBigint(payload, COORD_SIZE, COORD_SIZE);
     return { r, s };

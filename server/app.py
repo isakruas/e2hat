@@ -334,7 +334,7 @@ async def _deliver_queued(app, pubkey_hex):
     now = time.time()
     queue = app["queues"].pop(pubkey_hex, [])
     # Clean up queue_owners references to this dest
-    for sender_hex, dests in app["queue_owners"].items():
+    for _sender_hex, dests in app["queue_owners"].items():
         dests.discard(pubkey_hex)
     for item in queue:
         queued_at = item.get("queued_at", now)
