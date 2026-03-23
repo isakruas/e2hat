@@ -1839,9 +1839,18 @@ createApp({
         // Convert data URI to Blob URL for reliable media playback
         // Large data URIs in src attributes fail in many browsers
         const blobUrlCache = new Map();
+        const blobRefCache = new Map(); // keep Blob references so GC doesn't revoke URLs on mobile
         function dataUriToBlobUrl(dataUri) {
             const cacheKey = dataUri.length + ':' + dataUri.substring(0, 80);
-            if (blobUrlCache.has(cacheKey)) return blobUrlCache.get(cacheKey);
+            if (blobUrlCache.has(cacheKey)) {
+                const cached = blobUrlCache.get(cacheKey);
+                // Verify blob URL is still valid (mobile browsers may revoke under memory pressure)
+                const blobRef = blobRefCache.get(cacheKey);
+                if (blobRef && blobRef.size > 0) return cached;
+                // Blob was GC'd — re-create below
+                blobUrlCache.delete(cacheKey);
+                blobRefCache.delete(cacheKey);
+            }
             try {
                 const commaIdx = dataUri.indexOf(',');
                 if (commaIdx < 0) return dataUri;
@@ -1850,12 +1859,14 @@ createApp({
                 // Capture full MIME type with parameters (e.g. audio/webm;codecs=opus)
                 const mimeMatch = header.match(/data:(.+);base64/);
                 const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+                // Decode base64 in chunks to handle large payloads on mobile
                 const binary = atob(base64Data);
                 const bytes = new Uint8Array(binary.length);
                 for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
                 const blob = new Blob([bytes], { type: mime });
                 const url = URL.createObjectURL(blob);
                 blobUrlCache.set(cacheKey, url);
+                blobRefCache.set(cacheKey, blob); // prevent GC from revoking the URL
                 return url;
             } catch (e) {
                 log(`Blob URL conversion failed: ${e.message}`);
@@ -1871,12 +1882,23 @@ createApp({
 
         // For audio/video: lazy load — only convert when user clicks
         function loadMedia(msg) {
-            if (msg._blobUrl) return;
+            // Allow retry if previous blob URL was revoked (mobile GC), max 1 retry
+            if (msg._blobUrl && msg._blobUrl !== 'error' && msg._blobUrl !== 'revoked') return;
+            if (msg._blobUrl === 'revoked') {
+                // Clear cache so dataUriToBlobUrl re-creates the blob
+                const cacheKey = msg.text.length + ':' + msg.text.substring(0, 80);
+                blobUrlCache.delete(cacheKey);
+                blobRefCache.delete(cacheKey);
+                msg._blobRetries = (msg._blobRetries || 0) + 1;
+                if (msg._blobRetries > 1) { msg._blobUrl = 'error'; return; }
+            }
             const url = dataUriToBlobUrl(msg.text);
             if (url && url.startsWith('blob:')) {
                 msg._blobUrl = url;
+            } else if (url && url.startsWith('data:')) {
+                // Blob conversion failed but data URI is valid — use directly as fallback
+                msg._blobUrl = url;
             } else {
-                // Blob conversion failed (corrupt data) — show error
                 msg._blobUrl = 'error';
                 log(`Media corrupted: could not decode base64 (${msg.text.length} chars)`);
             }
@@ -1995,13 +2017,31 @@ createApp({
             // Start recording
             navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
                 recordedChunks = [];
+                // Try formats in order of preference: webm/opus (Chrome/Firefox), mp4 (Safari/iOS), fallback
+                const mimeTypes = [
+                    'audio/webm;codecs=opus',
+                    'audio/webm',
+                    'audio/mp4',
+                    'audio/aac',
+                    'audio/ogg;codecs=opus',
+                ];
                 let options;
-                try {
-                    options = { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 8000 };
-                    mediaRecorder = new MediaRecorder(stream, options);
-                } catch (_e) {
-                    options = { mimeType: 'audio/webm', audioBitsPerSecond: 8000 };
-                    mediaRecorder = new MediaRecorder(stream, options);
+                let selected = false;
+                for (const mime of mimeTypes) {
+                    if (MediaRecorder.isTypeSupported(mime)) {
+                        options = { mimeType: mime, audioBitsPerSecond: 8000 };
+                        try {
+                            mediaRecorder = new MediaRecorder(stream, options);
+                            selected = true;
+                            log(`Recording with ${mime}`);
+                            break;
+                        } catch (_e) { /* try next */ }
+                    }
+                }
+                if (!selected) {
+                    // Last resort: let browser pick default
+                    mediaRecorder = new MediaRecorder(stream);
+                    log(`Recording with default mimeType`);
                 }
 
                 mediaRecorder.ondataavailable = (e) => {
