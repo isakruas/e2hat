@@ -334,6 +334,8 @@ createApp({
         //   generation: number,       — monotonic counter for rekey cycles
         // }
         const ephemeralKeys = reactive({});
+        const probeState = {};        // contactHex -> { token, resolve, timer }
+        const probeSuccessCache = {}; // contactHex -> timestamp of last success
         let _ephemeralAesKey = null; // cached AES-GCM key (derived from user password) for encrypting ephemeral privkeys in IDB
 
         const koblitz = new Koblitz(CURVE_NAME);
@@ -775,7 +777,12 @@ createApp({
                     if (!ek || ek.state !== 'complete') continue;
                     if (Date.now() - ek.negotiatedAt > REKEY_INTERVAL_MS) {
                         const idx = findServerForPeer(c.keyHex);
-                        if (idx >= 0) initiateEphemeralExchange(c.keyHex, idx);
+                        if (idx >= 0) {
+                            delete ephemeralKeys[c.keyHex];
+                            delete probeSuccessCache[c.keyHex];
+                            saveEphemeralKeys();
+                            initiateEphemeralExchange(c.keyHex, idx);
+                        }
                     }
                 }
             }, 60000);
@@ -949,6 +956,11 @@ createApp({
                     const c = contacts.find(c => c.keyHex === hex);
                     log(`[${srv.name}] Peer online: ${c ? c.nickname : hex.substring(0, 16) + '...'} (${srv.onlinePeers.size} peers)`);
                     if (c) {
+                        // Peer reconnected — invalidate old ephemeral keys (peer may have lost theirs)
+                        // and force renegotiation so both sides use identity keys until new exchange completes
+                        delete ephemeralKeys[hex];
+                        delete probeSuccessCache[hex];
+                        saveEphemeralKeys();
                         initiateEphemeralExchange(hex, srvIdx);
                     }
                     break;
@@ -1067,6 +1079,15 @@ createApp({
             }
             if (missingParts > 0) {
                 log(`Multipart assembly: ${missingParts} missing parts out of ${mp.total}`);
+            }
+
+            // Probe messages should never be multipart, but discard defensively
+            if (fullText.charAt(0) === PROBE_MARKER) {
+                if (messages[mp.senderHex] && mp.msgIndex !== undefined) {
+                    messages[mp.senderHex].splice(mp.msgIndex, 1);
+                }
+                delete pendingMultiparts[key];
+                return;
             }
 
             // Check for ephemeral key exchange after reassembly
@@ -1222,6 +1243,13 @@ createApp({
             const storageE = decryptedMPoint.mul(storageScalar);
             const [storageEX, storageEParity] = storageE.compress();
 
+            // Check for probe message (key alignment verification)
+            if (text.charAt(0) === PROBE_MARKER) {
+                await handleProbeMessage(text, session.senderHex, srvIdx);
+                delete pendingRecvSessions[sessionId];
+                return;
+            }
+
             // Check for ephemeral key exchange message
             if (text.charAt(0) === EPHEMERAL_MARKER) {
                 await handleEphemeralMessage(text, session.senderHex);
@@ -1239,30 +1267,39 @@ createApp({
                     const key = session.senderHex + ':' + groupId;
 
                     if (!pendingMultiparts[key]) {
-                        ensureContact(session.senderHex);
-                        if (!messages[session.senderHex]) messages[session.senderHex] = [];
-                        const placeholderIdx = messages[session.senderHex].length;
-                        messages[session.senderHex].push({
-                            text: `Receiving 1/${total}...`, sent: false,
-                            time: new Date().toLocaleTimeString(), ts: Date.now(),
-                            verified: true, _receiving: true,
-                        });
-                        scrollMessages();
+                        // Detect internal (ephemeral key exchange) messages from first chunk —
+                        // these must not create any UI placeholder
+                        const isInternal = partIdx === 0 && (content.charAt(0) === EPHEMERAL_MARKER || content.charAt(0) === PROBE_MARKER);
+                        let placeholderIdx;
+                        if (!isInternal) {
+                            ensureContact(session.senderHex);
+                            if (!messages[session.senderHex]) messages[session.senderHex] = [];
+                            placeholderIdx = messages[session.senderHex].length;
+                            messages[session.senderHex].push({
+                                text: `Receiving 1/${total}...`, sent: false,
+                                time: new Date().toLocaleTimeString(), ts: Date.now(),
+                                verified: true, _receiving: true,
+                            });
+                            scrollMessages();
+                        }
                         pendingMultiparts[key] = {
                             total, parts: {}, verified: true,
                             senderHex: session.senderHex,
                             time: new Date().toLocaleTimeString(), ts: Date.now(),
                             msgIndex: placeholderIdx,
+                            _internal: isInternal,
                         };
                     }
                     const mp = pendingMultiparts[key];
                     mp.parts[partIdx] = content;
                     if (!verified) mp.verified = false;
 
-                    // Update placeholder with progress
-                    const received = Object.keys(mp.parts).length;
-                    if (messages[mp.senderHex] && messages[mp.senderHex][mp.msgIndex]) {
-                        messages[mp.senderHex][mp.msgIndex].text = `Receiving ${received}/${total}...`;
+                    // Update placeholder with progress (skip for internal/ephemeral messages)
+                    if (!mp._internal) {
+                        const received = Object.keys(mp.parts).length;
+                        if (messages[mp.senderHex] && messages[mp.senderHex][mp.msgIndex] !== undefined) {
+                            messages[mp.senderHex][mp.msgIndex].text = `Receiving ${received}/${total}...`;
+                        }
                     }
 
                     // Reset timeout for incomplete multiparts
@@ -1380,6 +1417,12 @@ createApp({
         const EPHEMERAL_RESPOND = 'R';
         const REKEY_INTERVAL_MS = 30 * 60 * 1000; // 30 min
 
+        const PROBE_MARKER = '\x03';
+        const PROBE_CHALLENGE = 'C';
+        const PROBE_ACK = 'A';
+        const PROBE_TIMEOUT_MS = 8000;
+        const PROBE_CACHE_TTL_MS = 15000;
+
         /** Return {myPriv, peerPub} for DH — ephemeral if negotiated, else identity keys. */
         function getActiveKeys(contactHex) {
             const ek = ephemeralKeys[contactHex];
@@ -1420,6 +1463,93 @@ createApp({
                 pendingSendQueues[srvIdx].push({ moInstance: srv.mo, destHex, j, msgIndex: -1, srvIdx, _resolve: resolve });
                 srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, j, c1X, c1Parity, sigR, sigS, timestampMs));
             });
+        }
+
+        /** Send a probe chunk silently using active keys (ephemeral if available).
+         *  Unlike sendInternalChunk, this tests the real active keys for alignment. */
+        function sendProbeChunk(chunkText, destHex, srvIdx) {
+            return new Promise(async (resolve) => {
+                const srv = servers[srvIdx];
+                while (srv._rateLimited) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+                const nonce = generateNonce();
+                const paddedText = nonce + chunkText;
+                const [mPoint, j] = koblitz.encode(paddedText);
+                const destPt = hexToPoint(destHex);
+                const timestampMs = Date.now();
+                const { myPriv, peerPub } = getActiveKeys(destHex);
+                const dh = new DiffieHellman(myPriv, CURVE_NAME);
+                const shared = dh.computeSharedSecret(peerPub);
+                const scalar = await deriveScalar(shared.x, timestampMs, destHex, j);
+                const ePoint = mPoint.mul(scalar);
+                const [_eX, eParity] = ePoint.compress();
+                const sigPayload = `${ePoint.x.toString(16)}:${eParity}:${j}:${timestampMs}:${destHex}`;
+                const signer = new DigitalSignature(dhPrivateKey.value, CURVE_NAME);
+                const [sigR, sigS] = await signer.signMessage(sigPayload);
+                const c1Point = srv.mo.encrypt(ePoint);
+                const [c1X, c1Parity] = c1Point.compress();
+                if (!pendingSendQueues[srvIdx]) pendingSendQueues[srvIdx] = [];
+                pendingSendQueues[srvIdx].push({ moInstance: srv.mo, destHex, j, msgIndex: -1, srvIdx, _resolve: resolve });
+                srv.ws.send(P.packMoSendInit(destPt.x, destPt.parity, j, c1X, c1Parity, sigR, sigS, timestampMs));
+            });
+        }
+
+        /** Send a probe challenge to verify key alignment with a peer. Returns a Promise. */
+        function sendProbeChallenge(destHex, srvIdx) {
+            return new Promise((resolve, reject) => {
+                const token = generateGroupId(); // 8 hex chars
+                const payload = PROBE_MARKER + PROBE_CHALLENGE + token;
+                log(`Probe challenge sent to ${destHex.substring(0, 16)}... (token: ${token})`);
+                const timer = setTimeout(() => {
+                    delete probeState[destHex];
+                    reject(new Error('probe_timeout'));
+                }, PROBE_TIMEOUT_MS);
+                probeState[destHex] = { token, resolve, timer };
+                enqueueSend(() => sendProbeChunk(payload, destHex, srvIdx));
+            });
+        }
+
+        /** Handle incoming probe messages (\x03C challenge or \x03A ack). */
+        async function handleProbeMessage(text, senderHex, srvIdx) {
+            const type = text.charAt(1);
+            const token = text.substring(2);
+            if (type === PROBE_CHALLENGE) {
+                log(`Probe challenge received from ${senderHex.substring(0, 16)}... — responding`);
+                const ackPayload = PROBE_MARKER + PROBE_ACK + token;
+                const idx = srvIdx >= 0 ? srvIdx : findServerForPeer(senderHex);
+                if (idx >= 0) {
+                    await enqueueSend(() => sendProbeChunk(ackPayload, senderHex, idx));
+                }
+            } else if (type === PROBE_ACK) {
+                const ps = probeState[senderHex];
+                if (ps && ps.token === token) {
+                    clearTimeout(ps.timer);
+                    ps.resolve(true);
+                    delete probeState[senderHex];
+                    probeSuccessCache[senderHex] = Date.now();
+                    log(`Probe ack received from ${senderHex.substring(0, 16)}... — keys aligned`);
+                }
+            }
+        }
+
+        /** Pre-send gate: verify key alignment before sending a real message.
+         *  Returns immediately if peer is offline, no ephemeral keys, or cache is fresh. */
+        async function ensureKeyAlignment(destHex, srvIdx) {
+            if (!isOnline(destHex)) return;
+            const ek = ephemeralKeys[destHex];
+            if (!ek || ek.state !== 'complete') return;
+            const cached = probeSuccessCache[destHex];
+            if (cached && Date.now() - cached < PROBE_CACHE_TTL_MS) return;
+            try {
+                await sendProbeChallenge(destHex, srvIdx);
+            } catch (e) {
+                log(`Probe timeout for ${destHex.substring(0, 16)}... — falling back to identity keys`);
+                delete ephemeralKeys[destHex];
+                saveEphemeralKeys();
+                delete probeSuccessCache[destHex];
+                initiateEphemeralExchange(destHex, srvIdx);
+            }
         }
 
         /** Send an ephemeral key exchange payload via multipart (silent, no UI).
@@ -1513,6 +1643,7 @@ createApp({
                     await sendEphemeralPayload(payload, senderHex, srvIdx);
                 }
                 saveEphemeralKeys();
+                delete probeSuccessCache[senderHex];
                 log(`Ephemeral key exchange complete with ${senderHex.substring(0, 16)}... (gen ${gen})`);
             } else if (type === EPHEMERAL_RESPOND) {
                 const ek = ephemeralKeys[senderHex];
@@ -1525,6 +1656,7 @@ createApp({
                 ek.state = 'complete';
                 ek.negotiatedAt = Date.now();
                 saveEphemeralKeys();
+                delete probeSuccessCache[senderHex];
                 log(`Ephemeral key exchange complete with ${senderHex.substring(0, 16)}... (gen ${ek.generation})`);
             }
         }
@@ -1783,6 +1915,7 @@ createApp({
 
         /** Send a media file (image/audio/video) as data URI via multipart chunks. */
         async function sendMediaMessage(dataUri, destHex, srvIdx) {
+            await ensureKeyAlignment(destHex, srvIdx);
             const parts = splitMedia(dataUri, MULTIPART_KOBLITZ_MAX);
             if (parts.length > MAX_MULTIPART_PARTS) {
                 log(`Media too large: ${parts.length} parts needed (max ${MAX_MULTIPART_PARTS})`);
@@ -1911,6 +2044,8 @@ createApp({
             const srvIdx = findServerForPeer(destHex);
             if (srvIdx < 0) { log('No connected server available'); return; }
 
+            await ensureKeyAlignment(destHex, srvIdx);
+
             messageInput.value = '';
             scrollMessages();
 
@@ -1995,8 +2130,9 @@ createApp({
             // Purge all message history for this contact
             delete messages[c.keyHex];
             idbDel('messages', c.keyHex).catch(() => {});
-            // Clean up ephemeral keys for this contact
+            // Clean up ephemeral keys and probe cache for this contact
             delete ephemeralKeys[c.keyHex];
+            delete probeSuccessCache[c.keyHex];
             saveEphemeralKeys();
             // Remove any pending multiparts from this contact
             for (const key of Object.keys(pendingMultiparts)) {
