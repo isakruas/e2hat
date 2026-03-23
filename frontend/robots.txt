@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+Disallow: /vendor/
+
+Sitemap: https://e2hat.com/sitemap.xml
